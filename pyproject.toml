@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvnn-text"
+version = "0.1.0"
+description = "Recursive Neural Network (RvNN) in PyTorch for grammar-driven text generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "William", email = "Williamxxoo@gmail.com" }]
+keywords = ["rvnn", "recursive-neural-network", "pytorch", "nlp", "parsing", "text-generation"]
+dependencies = [
+    "torch>=2.0",
+    "fire>=0.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+rvnn-train = "rvnn_text.train:cli"
+rvnn-generate = "rvnn_text.generate:cli"
+rvnn-demo = "rvnn_text.demo:cli"
+
+[tool.setuptools.packages.find]
+include = ["rvnn_text*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
