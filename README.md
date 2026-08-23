@@ -17,6 +17,7 @@
 - [应用](#应用)
 - [安装](#安装)
 - [使用方法](#使用方法)
+- [演示结果](#演示结果)
 - [项目结构](#项目结构)
 - [数据来源](#数据来源)
 - [扩展方向](#扩展方向)
@@ -202,6 +203,72 @@ model, _ = train_model(grammar, corpus, epochs=30, device=get_device())
 print(model.generate_sentence(seed_noise=1.0))   # 文法约束生成
 h = model.encode_sentence("the cat sees a dog")  # 解析 + 编码
 print(model.generate_sentence(root_embedding=h)) # 从向量解码
+```
+
+---
+
+## 演示结果
+
+以下为 `python -m rvnn_text.demo` 在 Apple Silicon（MPS）上的实测输出（1500 句、20 epochs、`dim=64`）。
+
+### 1. 训练收敛
+
+| epoch | loss   | rule    | word    | recon   | val     |
+|-------|--------|---------|---------|---------|---------|
+| 1     | 0.3153 | 0.0421  | 0.0950  | 0.1783  | 0.1491  |
+| 5     | 0.0887 | 0.0003  | 0.0008  | 0.0876  | 0.0863  |
+| 10    | 0.0741 | 0.0000  | 0.0002  | 0.0739  | 0.0736  |
+| 15    | 0.0676 | 0.0000  | 0.0001  | 0.0675  | 0.0672  |
+| 20    | 0.0603 | 0.0000  | 0.0000  | 0.0602  | 0.0604  |
+
+规则损失（rule）在第 9 个 epoch 后降至 0，单词损失（word）在第 16 个 epoch 后归零——解码器已完全掌握文法；剩余损失主要来自重构项（recon）。
+
+### 2. 文法内化：held-out 准确率
+
+```
+held-out rule-prediction accuracy: 100.0%
+held-out word-prediction accuracy: 100.0%
+```
+
+### 3. 文法约束生成（采样）
+
+```
+Bob sees
+Alice likes quickly
+Mary likes a happy clever small cat
+a red tree chases quickly
+```
+
+递归规则 `NOM → Adj NOM` 让模型能生成任意长度的形容词链，且永远合乎文法：
+
+```
+S
+├── NP
+│   └── Proper: Mary
+└── VP
+    ├── Verb: likes
+    └── NP
+        ├── Det: a
+        └── NOM
+            ├── Adj: happy
+            └── NOM
+                ├── Adj: clever
+                └── NOM
+                    ├── Adj: small
+                    └── NOM
+                        └── Noun: cat
+```
+
+### 4. 编码-解码往返（round-trip）
+
+句子解析成树 → 编码为根向量 → 从根向量重新解码，可逐词重建：
+
+```
+input:  the happy cat sees a dog
+output: the happy cat sees a dog
+
+input:  every clever girl likes the robot
+output: every clever girl likes the robot
 ```
 
 ---
