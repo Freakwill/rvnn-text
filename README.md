@@ -90,6 +90,45 @@ p = tanh( W_unary · c + b_unary )                        # 一元节点
 关键细节：单词预测以**父节点向量**为条件（而非叶子自身的向量），否则"用词向量预测它自己对应的
 词"是平凡退化问题。
 
+### 判别式的 RvNN 怎么"重构"与"生成"？（递归自编码器，而非变分）
+
+**经典 RvNN 确实是判别式的**：Socher 2011 / 2013 的 RvNN 只有编码器——把句法树组合成一个向量，
+然后接一个分类头做情感分析等任务。它**没有生成能力**，因为它从不"逆向"把向量展开回树。
+
+本项目要重构（round-trip）与生成，靠的是**递归自编码器（recursive autoencoder, RAE）**路线，
+**不是变分 RvNN（VAE-RvNN）**。二者的区别在于"潜变量怎么处理"：
+
+| | 判别式 RvNN（Socher 分类器） | **本项目：递归自编码器（RAE）** | 变分 RvNN（VAE-RvNN） |
+|---|---|---|---|
+| 编码器 | 有（树 → 向量） | 有（树 → 向量，标准 RvNN） | 有（树 → μ, σ²） |
+| 解码器 | **无** | **有**：确定性自顶向下逆变换 | 有：从 z ~ N(μ, σ²) 采样后展开 |
+| 潜变量 | — | 确定性根向量 `h_root`（点估计） | 随机向量 z（后验分布） |
+| 训练目标 | 分类交叉熵 | 重构 MSE（detach）+ 规则/单词 CE | 重构 + **KL 正则** |
+
+**解码器是什么**：RAE 把"组合函数"当作可逆的来学——每层一组线性投影
+`D_left` / `D_right`（以及单元用的 `D_unary`），它们近似组合函数 `tanh(W_l·h_l + W_r·h_r + b)` 的逆。
+解码时自顶向下：给定父向量 `h`，(a) 规则分类器选出产生式，(b) 用 `D_left/D_right` 投影出子节点向量并递归，
+(c) 到词性叶子时由单词预测器从父向量采样单词。**每一步都被文法约束住**，所以展开结果永远合法。
+
+**重构为什么能还原原句**：重构损失 `‖D_child(h_parent) − h_child‖²`（**目标 detach**——只训练解码投影、
+不让编码器被解码器"拉塌缩"，这是 RAE 训练的经典要点）迫使投影真正成为组合的逆；贪心解码时每个
+节点都取 argmax，就从根向量逐步还原出整棵树。
+
+**生成为什么能造新句**：自由生成从可学习起始向量 `start_embedding`（+ 可选高斯噪声）出发，同样自顶向下
+展开——噪声让每次落在 `h_root` 空间的不同位置，于是产生**与训练语料不同的新句子**。注意这里的
+`start_embedding + 噪声` 只是生成时的**探索技巧**（点估计 + 抖动），**不是**变分模型学出来的先验分布
+`p(z)`，也没有 KL 项；真正的 VAE-RvNN（学习 μ/σ、对 z 采样、加 KL 正则）是本项目的扩展方向之一
+（见[扩展方向](#扩展方向)）。
+
+**提示词条件生成（本项目 `generate_from_prompt`）**：把提示句解析、编码成根向量 `h`，再用解码器的
+右投影 `D_right(h)` 得到"续写部分"的嵌入（训练时 `D_right` 的任务正是从 `Story` 根向量还原第二个
+子句的向量），从该嵌入自顶向下展开出续写故事。因此续写中的每个词都**经由投影链受提示词向量支配**——
+这是 RAE 内禀的条件生成机制，无需变分推断。
+
+**参考文献**：解码端的思想来自 *Dynamic Pooling and Unfolding Recursive Autoencoders*（Socher et al.,
+ICML 2011）——"unfolding" 就是自顶向下展开解码；RAE 的编码-解码训练框架见 *Dynamic Pooling and
+Unfolding RAE* 与 *Semi-supervised Recursive Autoencoders*（Socher et al., 2011）。
+
 ---
 
 ## 与文法分析的联系
@@ -154,7 +193,7 @@ python -m rvnn_text.demo
 
 会依次展示：文法定义 → 采样出的**故事句法树**（一段话 = 一棵多句树）→ 训练过程 → 文法学习准确率
 → **新故事生成**（与原文不同的句子）→ **cloze 填空**（mask 单词后经编码-解码重建）→ **自动续写**
-（mask 后半段后重建）。可调参数：
+（mask 后半段后重建）→ **提示词条件生成**（给定 `[提示句]`，续写出更长的段落）。可调参数：
 
 ```bash
 python -m rvnn_text.demo --num_sentences 1500 --epochs 20 --n_samples 6 --mask_frac 0.2
@@ -216,9 +255,14 @@ print(r["input"], "->", r["output"])
 # 自动续写：保留前 4 个词，mask 后半段并重建
 r = model.continue_sentence("the happy small clever cat sees a red tree", keep=5)
 print(r["input"], "->", r["output"])
+
+# 提示词条件生成：给定提示句，续写出更长的段落（编码提示词 -> D_right 投影 -> 解码）
+tree = model.generate_from_prompt("every clever girl likes a cat", temperature=0.9)
+print(tree)  # Story 树：提示句逐字保留 + 续写句子
 ```
 
-单句文法同样可用（`Grammar()`，start=`S`）。
+单句文法同样可用（`Grammar()`，start=`S`）。`generate_from_prompt` 的续写原理见
+[判别式的 RvNN 怎么"重构"与"生成"](#判别式的-rvnn-怎么重构与生成递归自编码器而非变分)。
 
 ---
 
@@ -308,6 +352,20 @@ completed: the happy small clever cat eats a red cat       ← 与原文不同
 story:     Alice likes a cat Bob chases the dog
 masked:    Alice likes a cat [MASK] [MASK] [MASK] [MASK]
 completed: Alice likes a cat Alice eats every cat          ← 与原文不同
+```
+
+### 6. 提示词条件生成（`[提示句]` → 更长的段落）
+
+给定一个合法的提示句，编码成根向量后经 `D_right` 投影驱动解码器续写（原理见
+[判别式的 RvNN 怎么"重构"与"生成"](#判别式的-rvnn-怎么重构与生成递归自编码器而非变分)），
+提示句逐字保留，续写出更长的段落：
+
+```
+prompt:    [every clever girl likes a cat]
+generated: every clever girl likes a cat. every tree eats the happy tree. a small small clever tree sees loudly.
+
+prompt:    [a red tree chases the happy boy]
+generated: a red tree chases the happy boy. the red happy tree sees slowly.
 ```
 
 > 说明：cloze 与续写均基于**自底向上编码 + 父节点向量预测**。对一棵树，某个被 mask 叶子的父节点

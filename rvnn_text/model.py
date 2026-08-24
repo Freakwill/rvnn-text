@@ -280,6 +280,54 @@ class RvNNText(nn.Module):
         }
 
     @torch.no_grad()
+    def generate_from_prompt(self, prompt: str, temperature: float = 1.0,
+                             greedy: bool = False, max_depth: int = 12,
+                             seed_noise: float = 0.0) -> Node | None:
+        """Generate a story that opens with ``prompt`` and continues.
+
+        Mechanism (recursive autoencoder, not variational): the prompt is
+        parsed and encoded bottom-up into a root vector ``h``; the decoder's
+        right projection ``D_right`` turns ``h`` into an embedding for the
+        continuation (in training it reconstructs the second child of a
+        ``Story`` node), and the rest of the story is generated top-down from
+        that embedding — so every continuation word is conditioned on the
+        prompt's vector.  The prompt sentence itself is spliced in verbatim.
+
+        Args:
+            prompt: a single sentence of the grammar's vocabulary (e.g.
+                ``"every clever girl likes a cat"``).
+            temperature: sampling temperature for rules/words.
+            greedy: take the argmax at every step instead of sampling.
+            max_depth: maximum tree depth for the continuation.
+            seed_noise: std of Gaussian noise added to the prompt vector.
+
+        Returns a merged ``Story`` node (prompt sentence + continuation), or
+        ``None`` if the prompt is not parseable.
+        """
+
+        def first_s(node: Node) -> Node | None:
+            if node.symbol == "S":
+                return node
+            for c in node.children:
+                found = first_s(c)
+                if found is not None:
+                    return found
+            return None
+
+        tree = self.grammar.parse_sentence(prompt)
+        if tree is None:
+            return None
+        s_node = first_s(tree)
+        if s_node is None:
+            return None
+        h = self.encode(tree)
+        if seed_noise > 0.0:
+            h = h + seed_noise * torch.randn_like(h)
+        cont_h = self.D_right(h)
+        rest = self._generate_node("Story", cont_h, temperature, greedy, max_depth)
+        return Node(symbol="Story", children=[s_node, rest])
+
+    @torch.no_grad()
     def evaluate(self, trees: list[Node]) -> dict[str, float]:
         """Return held-out rule- and word-prediction accuracy.
 

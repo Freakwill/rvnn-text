@@ -140,6 +140,22 @@ def main(
         print(f"  completed: {r['output']}{note}")
         print()
 
+    print("=" * 70)
+    print("7. Prompt-conditioned paragraph generation")
+    print("=" * 70)
+    prompts = [
+        "every clever girl likes a cat",
+        "a red tree chases the happy boy",
+    ]
+    for prompt in prompts:
+        tree = model.generate_from_prompt(prompt, temperature=0.9)
+        if tree is None:
+            print(f"  cannot parse prompt: {prompt}")
+            continue
+        print(f"  prompt:    [{prompt}]")
+        print(f"  generated: {_paragraph(tree)}")
+        print()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

@@ -3,7 +3,7 @@
 import torch
 
 from rvnn_text.data import make_corpus
-from rvnn_text.grammar import make_story_grammar
+from rvnn_text.grammar import flatten, make_story_grammar
 from rvnn_text.train import train_model
 from rvnn_text.utils import set_seed
 
@@ -80,3 +80,22 @@ def test_masked_training_still_learns_grammar():
     acc = model.evaluate(corpus)
     assert acc["rule_acc"] > 0.9
     assert acc["word_acc"] > 0.9
+
+
+def test_generate_from_prompt_opens_with_prompt_and_is_grammatical():
+    model = _trained_model()
+    tree = model.generate_from_prompt(
+        "every clever girl likes a cat", temperature=0.9
+    )
+    assert tree is not None
+    assert tree.symbol == "Story"
+    words = flatten(tree)
+    # prompt sentence must be spliced in verbatim at the start
+    assert " ".join(words[:6]) == "every clever girl likes a cat"
+    # the whole thing must parse under the grammar
+    assert model.grammar.parse(words) is not None
+
+
+def test_generate_from_prompt_rejects_unparseable():
+    model = _trained_model()
+    assert model.generate_from_prompt("a dragon flies", temperature=0.9) is None
