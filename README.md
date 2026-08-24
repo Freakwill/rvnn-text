@@ -21,6 +21,7 @@
 - [安装](#安装)
 - [使用方法](#使用方法)
 - [演示结果](#演示结果)
+- [实验](#实验)
 - [项目结构](#项目结构)
 - [数据来源](#数据来源)
 - [扩展方向](#扩展方向)
@@ -375,6 +376,67 @@ generated: a red tree chases the happy boy. the red happy tree sees slowly.
 
 ---
 
+## 实验
+
+### 1. 实验步骤
+
+1. **数据生成**：`make_corpus(grammar, 1500, seed=42)` 从内置故事文法采样 1500 棵故事树，按 9:1
+   划分 train/val（`seed` 固定，完全可复现）。
+2. **训练**：逐树 SGD（树结构异构，不做批处理）——Adam（`lr=1e-3`，梯度裁剪 5.0），20 epochs，
+   `dim=64`，`mask_frac=0.2`（树版 MLM），`recon_weight=1.0`。
+3. **评估**：`evaluate()` 度量 held-out 规则 / 单词预测准确率；随后依次执行新故事生成、cloze 填空、
+   自动续写、提示词条件生成四个任务。
+4. **环境**：Apple Silicon（MPS），PyTorch 2.x，单次完整训练约 8 分钟。
+
+复现命令：`python -m rvnn_text.demo`（即执行上述全部步骤）。
+
+### 2. 数据说明
+
+| 项 | 内容 |
+|---|---|
+| 数据来源 | **无外部数据集**——语料由内置文法合成、零下载，文法定义见 `rvnn_text/grammar.py`（`STORY_PRODUCTIONS`，start=`Story`） |
+| 数据量 | 1500 棵树（1350 train / 150 val），每棵 1~4 个句子 |
+| 数据格式 | 每棵树是一个递归的 `Node(symbol, word, children)` 结构，由 `data.make_corpus()` 采样生成 |
+
+树的数据格式（即 demo 第 2 节的采样输出）：
+
+```
+Story
+├── S
+│   ├── NP
+│   │   ├── Det: a
+│   │   └── NOM
+│   │       └── Noun: tree
+│   └── VP
+│       ├── Verb: sees
+│       └── NP
+│           └── Proper: Bob
+└── Story
+    └── S
+        ├── NP
+        │   └── Proper: Alice
+        └── VP
+            └── Verb: sees
+```
+
+对应代码结构：叶子 `Node("Noun", word="tree")`；内部节点 `Node("NP", children=[...])`。训练语料即
+`list[Node]`；要换真实数据，只需把外部语料的成分句法树转成同样的 `Node` 表示（见[数据来源](#数据来源)）。
+
+### 3. 实验结果
+
+- **文法内化**：held-out 规则预测准确率 **100%**、单词预测准确率 **100%**。训练 20 epochs 总损失
+  `0.5316 → 0.2932`，规则损失第 9 个 epoch 归零，重构损失 `0.1351 → 0.0246`；
+- **新故事生成**：从先验（可学习根向量 + 高斯噪声）采样出与训练语料**不同**的合法段落；
+- **Cloze 填空**：mask 词被合理补回，4/5 示例与原文不同但合乎文法（如 `the [MASK] cat` → `the red cat`、
+  `every clever girl [MASK] the robot` → `every clever girl eats the robot`）；
+- **自动续写**：mask 后半段后重建，产出语法正确、与原文不同的结尾；
+- **提示词条件生成**：提示句逐字保留，续写出更长的段落（如 `[every clever girl likes a cat]` →
+  `every clever girl likes a cat. every tree eats the happy tree. a small small clever tree sees loudly.`）。
+
+完整实测输出见[演示结果](#演示结果)。
+
+---
+
 ## 项目结构
 
 ```
@@ -407,7 +469,8 @@ python -m pytest
 见 `rvnn_text/grammar.py`）随机采样生成，零下载、可复现（`seed` 固定）。好处是每棵树都带有完整
 的句法标注，且语料规模任意可调；代价是词汇与句法都受限在文法之内。
 
-若要换用真实语料（尤其是带句法标注的），可参考以下来源（SST 与 RvNN 主题最契合）：
+> ⚠️ 下方列出的外部数据源**均未在本实验中使用**（本实验只用上述合成语料），仅作为日后换用真实语料
+> 的参考。若需要接入真实数据（尤其是带句法标注的），可参考（SST 与 RvNN 主题最契合）：
 
 | 来源 | 地址 | 说明 |
 |---|---|---|
