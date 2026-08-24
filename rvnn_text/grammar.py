@@ -48,6 +48,19 @@ DEFAULT_PRODUCTIONS: dict[str, list[tuple[str, ...]]] = {
     "Adv": [("quickly",), ("slowly",), ("loudly",)],
 }
 
+# Story grammar: wraps the sentence grammar into multi-sentence paragraphs.
+# ``Story -> S | S Story`` (right-recursive, so the top-down parser terminates)
+# makes the RvNN recursive at the paragraph level too.
+STORY_PRODUCTIONS: dict[str, list[tuple[str, ...]]] = {
+    "Story": [("S",), ("S", "Story")],
+    **DEFAULT_PRODUCTIONS,
+}
+
+
+def make_story_grammar() -> "Grammar":
+    """Return a grammar whose start symbol generates 1..N sentence paragraphs."""
+    return Grammar(STORY_PRODUCTIONS, start="Story")
+
 
 class Grammar:
     """A context-free grammar (CFG) plus helpers to sample, parse and render trees.

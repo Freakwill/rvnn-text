@@ -6,6 +6,9 @@
 - **不是 RNN**：RNN（循环神经网络）把文本当作一条**线性序列**从左到右处理；
   RvNN 则把文本当作一棵**句法树（parse tree）**，自底向上递归地组合子节点向量。
 - **文法约束生成**：解码器在**上下文无关文法（CFG）**的约束下自顶向下展开，因此生成的句子**永远合乎语法**。
+- **段落级递归**：内置故事文法 `Story → S | S Story`，一段话就是一棵多句树，模型在段落层面同样递归。
+- **Cloze 填空 & 自动续写**：训练时随机 mask 叶子（树版 MLM），推理时用编码-解码重建被 mask 的单词，
+  因此能**填空**、也能**续写**出与原文不同但合法的句子。
 - 纯 PyTorch 实现，支持 CUDA / MPS（Apple Silicon）/ CPU，设备自动选择。
 
 ---
@@ -149,26 +152,29 @@ pip install -e .
 python -m rvnn_text.demo
 ```
 
-会依次展示：文法定义 → 采样出的句法树 → 训练过程 → 文法学习准确率 → 文法约束生成 → 编码-解码
-往返（round-trip）。可调参数：
+会依次展示：文法定义 → 采样出的**故事句法树**（一段话 = 一棵多句树）→ 训练过程 → 文法学习准确率
+→ **新故事生成**（与原文不同的句子）→ **cloze 填空**（mask 单词后经编码-解码重建）→ **自动续写**
+（mask 后半段后重建）。可调参数：
 
 ```bash
-python -m rvnn_text.demo --num_sentences 1500 --epochs 20 --n_samples 6
+python -m rvnn_text.demo --num_sentences 1500 --epochs 20 --n_samples 6 --mask_frac 0.2
 ```
 
 ### 2. 训练
 
 ```bash
-python -m rvnn_text.train --num_sentences 4000 --epochs 30 --dim 64
+python -m rvnn_text.train --num_sentences 4000 --epochs 30 --dim 64 --story
 ```
 
 | 参数 | 含义 | 默认 |
 |---|---|---|
-| `num_sentences` | 从文法采样的训练句子数 | 4000 |
+| `num_sentences` | 从文法采样的训练树数 | 4000 |
 | `epochs` | 训练轮数 | 30 |
 | `dim` | 词向量/隐层维度 | 64 |
 | `lr` | 学习率 | 1e-3 |
 | `recon_weight` | 重构损失权重 | 1.0 |
+| `mask_frac` | 每棵树随机 mask 的叶子比例（树版 MLM，让模型学会 cloze / 续写；0 关闭） | 0.15 |
+| `story` | 用多句故事文法训练（start=`Story`），否则单句文法 | False |
 | `out_dir` | checkpoint 输出目录 | checkpoints |
 
 训练结束后模型保存在 `checkpoints/rvnn_text.pt`。
@@ -193,35 +199,46 @@ python -m rvnn_text.generate --from_sentence "the happy cat sees a dog"
 
 ```python
 from rvnn_text import Grammar, RvNNText, make_corpus, get_device, set_seed
+from rvnn_text.grammar import make_story_grammar
 from rvnn_text.train import train_model
 
 set_seed(42)
-grammar = Grammar()                      # 使用内置英文文法
-corpus = make_corpus(grammar, 4000)      # 采样句法树
-model, _ = train_model(grammar, corpus, epochs=30, device=get_device())
+grammar = make_story_grammar()           # 多句故事文法（start=Story）
+corpus = make_corpus(grammar, 4000)      # 采样故事树
+model, _ = train_model(grammar, corpus, epochs=30, mask_frac=0.2, device=get_device())
 
-print(model.generate_sentence(seed_noise=1.0))   # 文法约束生成
-h = model.encode_sentence("the cat sees a dog")  # 解析 + 编码
-print(model.generate_sentence(root_embedding=h)) # 从向量解码
+print(model.generate_sentence(seed_noise=1.0))   # 生成全新故事（文法约束）
+
+# cloze 填空：mask 第 1、3 个词，经编码-解码重建
+r = model.cloze("the happy cat sees a dog", mask_indices=[1, 3], greedy=True)
+print(r["input"], "->", r["output"])
+
+# 自动续写：保留前 4 个词，mask 后半段并重建
+r = model.continue_sentence("the happy small clever cat sees a red tree", keep=5)
+print(r["input"], "->", r["output"])
 ```
+
+单句文法同样可用（`Grammar()`，start=`S`）。
 
 ---
 
 ## 演示结果
 
-以下为 `python -m rvnn_text.demo` 在 Apple Silicon（MPS）上的实测输出（1500 句、20 epochs、`dim=64`）。
+以下为 `python -m rvnn_text.demo` 在 Apple Silicon（MPS）上的实测输出（1500 个故事、20 epochs、`dim=64`、`mask_frac=0.2`）。训练语料为内置文法合成的故事段落（见[数据来源](#数据来源)）。
 
 ### 1. 训练收敛
 
 | epoch | loss   | rule    | word    | recon   | val     |
 |-------|--------|---------|---------|---------|---------|
-| 1     | 0.3153 | 0.0421  | 0.0950  | 0.1783  | 0.1491  |
-| 5     | 0.0887 | 0.0003  | 0.0008  | 0.0876  | 0.0863  |
-| 10    | 0.0741 | 0.0000  | 0.0002  | 0.0739  | 0.0736  |
-| 15    | 0.0676 | 0.0000  | 0.0001  | 0.0675  | 0.0672  |
-| 20    | 0.0603 | 0.0000  | 0.0000  | 0.0602  | 0.0604  |
+| 1     | 0.5316 | 0.0404  | 0.3561  | 0.1351  | 0.1095  |
+| 5     | 0.3256 | 0.0003  | 0.2778  | 0.0475  | 0.0494  |
+| 10    | 0.3178 | 0.0000  | 0.2855  | 0.0322  | 0.0345  |
+| 15    | 0.3072 | 0.0000  | 0.2782  | 0.0290  | 0.0312  |
+| 20    | 0.2932 | 0.0000  | 0.2686  | 0.0246  | 0.0270  |
 
-规则损失（rule）在第 9 个 epoch 后降至 0，单词损失（word）在第 16 个 epoch 后归零——解码器已完全掌握文法；剩余损失主要来自重构项（recon）。
+规则损失（rule）在第 9 个 epoch 后归零（第 13 轮有一次回跳随即恢复）——模型完全掌握了产生式规则；
+word 损失高于纯监督设置，是因为其中包含**被 mask 单词**的预测项（树版 MLM，见下方 cloze / 续写），
+这部分本质上更困难；recon 损失持续下降，说明解码投影在逼近编码器。
 
 ### 2. 文法内化：held-out 准确率
 
@@ -230,46 +247,73 @@ held-out rule-prediction accuracy: 100.0%
 held-out word-prediction accuracy: 100.0%
 ```
 
-### 3. 文法约束生成（采样）
+### 3. 全新故事生成（与训练语料不同的句子）
+
+模型从先验（可学习根向量 + 高斯噪声）自顶向下采样出**从未出现在训练语料中**的新故事，且永远合乎文法：
 
 ```
-Bob sees
-Alice likes quickly
-Mary likes a happy clever small cat
-a red tree chases quickly
+a clever red robot sees slowly.
+Bob likes quickly.
+the small boy chases a robot.
+the girl sees Alice. every happy red robot eats slowly.
 ```
 
-递归规则 `NOM → Adj NOM` 让模型能生成任意长度的形容词链，且永远合乎文法：
+递归规则 `NOM → Adj NOM` 可生成任意长度的形容词链，句法树保证其合法性：
 
 ```
-S
-├── NP
-│   └── Proper: Mary
-└── VP
-    ├── Verb: likes
-    └── NP
-        ├── Det: a
-        └── NOM
-            ├── Adj: happy
-            └── NOM
-                ├── Adj: clever
-                └── NOM
-                    ├── Adj: small
-                    └── NOM
-                        └── Noun: cat
+Story
+└── S
+    ├── NP
+    │   ├── Det: a
+    │   └── NOM
+    │       ├── Adj: clever
+    │       └── NOM
+    │           ├── Adj: red
+    │           └── NOM
+    │               └── Noun: robot
+    └── VP
+        ├── Verb: sees
+        └── Adv: slowly
 ```
 
-### 4. 编码-解码往返（round-trip）
+### 4. Cloze 填空（mask 单词 → 编码-解码重建）
 
-句子解析成树 → 编码为根向量 → 从根向量重新解码，可逐词重建：
+mask 掉单词后，用 mask 向量自底向上编码，再让单词预测器从父节点向量补回——结果**合乎文法，且常常与原词不同**：
 
 ```
-input:  the happy cat sees a dog
-output: the happy cat sees a dog
+masked:  the [MASK] cat sees a dog
+filled:  the red cat sees a dog              ← 原文是 happy，模型改成了 red
 
-input:  every clever girl likes the robot
-output: every clever girl likes the robot
+masked:  every clever girl [MASK] the robot
+filled:  every clever girl eats the robot    ← 原文是 likes
+
+masked:  a [MASK] tree chases quickly
+filled:  a red tree chases quickly           ← 恰好与原词一致
+
+masked:  Mary likes [MASK] small clever cat
+filled:  Mary likes the small clever cat     ← 原文是 a，模型选了 the
+
+sampled fill (temperature=0.5): the clever cat sees a dog
 ```
+
+### 5. 自动续写（mask 后半段 → 重建）
+
+把句子的后半段（或故事的第二句）全部 mask，模型基于保留的前缀续写出**语法正确、与原文不同**的结尾：
+
+```
+story:     the happy small clever cat sees a red tree
+masked:    the happy small clever cat [MASK] [MASK] [MASK] [MASK]
+completed: the happy small clever cat eats a red cat       ← 与原文不同
+
+story:     Alice likes a cat Bob chases the dog
+masked:    Alice likes a cat [MASK] [MASK] [MASK] [MASK]
+completed: Alice likes a cat Alice eats every cat          ← 与原文不同
+```
+
+> 说明：cloze 与续写均基于**自底向上编码 + 父节点向量预测**。对一棵树，某个被 mask 叶子的父节点
+> 向量只由它自己的子节点（mask 与未 mask 的兄弟）构成，因此**名词**（其父节点是单元产生的 NOM）
+> 的填空基本无上下文；而 **Det / Adj / Verb**（父节点为二叉节点）能真正利用上下文。要获得全局
+> 上下文约束的续写，需要 TreeLSTM 式的自上而下信息流（见[扩展方向](#扩展方向)）。
 
 ---
 
@@ -301,8 +345,11 @@ python -m pytest
 
 ## 数据来源
 
-本项目为了**零依赖、开箱即用**，用内置文法 `Grammar` 自行生成合成语料。若要换用真实数据（尤其是带
-句法标注的），可参考以下来源（SST 与 RvNN 主题最契合）：
+**本项目演示所用的语料是合成的**：由内置文法（`DEFAULT_PRODUCTIONS` / `STORY_PRODUCTIONS`，
+见 `rvnn_text/grammar.py`）随机采样生成，零下载、可复现（`seed` 固定）。好处是每棵树都带有完整
+的句法标注，且语料规模任意可调；代价是词汇与句法都受限在文法之内。
+
+若要换用真实语料（尤其是带句法标注的），可参考以下来源（SST 与 RvNN 主题最契合）：
 
 | 来源 | 地址 | 说明 |
 |---|---|---|
@@ -310,9 +357,11 @@ python -m pytest
 | Kaggle | <https://www.kaggle.com/> | 竞赛与社区数据集 |
 | IEEE DataPort | <https://ieee-dataport.org/> | 科研数据集（IEEE 官方） |
 | Stanford Sentiment Treebank | <https://nlp.stanford.edu/sentiment/> | 成分句法树 + 逐节点情感标签，RvNN 经典基准 |
+| Project Gutenberg | <https://www.gutenberg.org/> | 公有领域故事 / 诗歌全文，可从中抽取词汇与句式来扩写自定义文法 |
 
 接入真实数据的方法：把外部语料的成分句法树转换成 `rvnn_text.grammar.Node`（叶子为词性 + 单词，
-内部节点为短语类别），再复用 `train_model` 即可。
+内部节点为短语类别），再复用 `train_model` 即可。若只有裸文本（无句法标注），可先用现成 parser
+（如 Stanford Parser、spaCy）产出成分树，或把文本的词汇/句式吸收进自定义文法后照常采样训练。
 
 ---
 

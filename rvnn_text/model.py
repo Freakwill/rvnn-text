@@ -16,6 +16,8 @@ Training follows the recursive-autoencoder recipe:
 
 from __future__ import annotations
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,6 +94,11 @@ class RvNNText(nn.Module):
         # Learned root vector that generation starts from.
         self.start_embedding = nn.Parameter(torch.randn(dim) * 0.1)
 
+        # Mask embedding: used in cloze / auto-completion. A masked leaf is
+        # encoded with this vector, so its parent must predict the word from
+        # the surrounding context only (the tree analogue of BERT's [MASK]).
+        self.mask_embedding = nn.Parameter(torch.randn(dim) * 0.1)
+
         self.dropout = nn.Dropout(dropout)
 
     # -- encoding ----------------------------------------------------------
@@ -136,6 +143,142 @@ class RvNNText(nn.Module):
         bottom_up(root)
         return true_h
 
+    # -- masked encoding (cloze / auto-completion) -------------------------
+
+    def _encode_tree_masked(self, root: Node, masked: set[int]) -> dict[int, torch.Tensor]:
+        """Encode every node bottom-up; leaves whose ``id()`` is in ``masked``
+        use the mask embedding instead of their word embedding."""
+        device = self.word_emb.weight.device
+        true_h: dict[int, torch.Tensor] = {}
+
+        def bottom_up(node: Node) -> torch.Tensor:
+            if node.is_leaf:
+                if id(node) in masked:
+                    return self.mask_embedding
+                assert node.word is not None  # a leaf always carries a word
+                return self.word_emb(
+                    torch.tensor(self.word_to_idx[node.word], device=device)
+                )
+            h = self.compose([bottom_up(c) for c in node.children])
+            true_h[id(node)] = h
+            return h
+
+        bottom_up(root)
+        return true_h
+
+    def _leaf_pairs(self, root: Node) -> list[tuple[Node, Node]]:
+        """Return ``(leaf, parent)`` pairs in left-to-right order.
+
+        The parent is the leaf's immediate parent node, whose embedding the
+        word predictor is conditioned on.
+        """
+        pairs: list[tuple[Node, Node]] = []
+
+        def rec(node: Node) -> None:
+            if node.is_leaf:
+                return
+            for child in node.children:
+                if child.is_leaf:
+                    pairs.append((child, node))
+                else:
+                    rec(child)
+
+        rec(root)
+        return pairs
+
+    def _fill_masked(self, tree: Node, mask_indices: list[int], greedy: bool,
+                     temperature: float) -> tuple[list[str], list[str], list[str]]:
+        """Core of cloze/auto-completion: mask leaves, encode, predict each
+        masked word from its parent embedding.
+
+        Returns ``(original_words, filled_words, masked_markup)`` where
+        ``masked_markup`` renders masked positions as ``[MASK]``.
+        """
+        pairs = self._leaf_pairs(tree)
+        masked = {id(pairs[i][0]) for i in mask_indices}
+        true_h = self._encode_tree_masked(tree, masked)
+        original: list[str] = []
+        filled: list[str] = []
+        markup: list[str] = []
+        for i, (leaf, parent) in enumerate(pairs):
+            assert leaf.word is not None  # a leaf always carries a word
+            original.append(leaf.word)
+            if i in mask_indices:
+                logits = self.word_predictors[leaf.symbol](true_h[id(parent)])
+                idx = self._sample(logits, temperature, greedy)
+                filled.append(self.preterm_words[leaf.symbol][idx])
+                markup.append("[MASK]")
+            else:
+                filled.append(leaf.word)
+                markup.append(leaf.word)
+        return original, filled, markup
+
+    @torch.no_grad()
+    def cloze(self, sentence: str, mask_indices: list[int] | None = None,
+              greedy: bool = True, temperature: float = 1.0) -> dict | None:
+        """Fill masked words via encode-decode (tree analogue of MLM).
+
+        Args:
+            sentence: a sentence (or story) in the grammar's vocabulary.
+            mask_indices: 0-based leaf positions to mask; defaults to a couple
+                of interior words (skipping the first and last leaf).
+            greedy: take the argmax word (True) or sample (False).
+            temperature: sampling temperature when ``greedy`` is False.
+
+        Returns a dict with ``input`` (``[MASK]`` markup), ``output`` (filled
+        sentence) and ``original``, or ``None`` if the sentence is unparseable.
+        """
+        tree = self.grammar.parse_sentence(sentence)
+        if tree is None:
+            return None
+        pairs = self._leaf_pairs(tree)
+        if not pairs:
+            return None
+        if mask_indices is None:
+            mask_indices = [i for i in range(1, len(pairs) - 1)][:2]
+        mask_indices = [i for i in mask_indices if 0 <= i < len(pairs)]
+        if not mask_indices:
+            return None
+        original, filled, markup = self._fill_masked(tree, mask_indices, greedy, temperature)
+        return {
+            "input": " ".join(markup),
+            "output": " ".join(filled),
+            "original": " ".join(original),
+            "mask_indices": mask_indices,
+        }
+
+    @torch.no_grad()
+    def continue_sentence(self, sentence: str, keep: float | int = 0.5,
+                          greedy: bool = True, temperature: float = 1.0) -> dict | None:
+        """Auto-complete a sentence/story by masking its tail and filling it.
+
+        Args:
+            sentence: a sentence (or story) in the grammar's vocabulary.
+            keep: how many leading words to keep — a fraction (``0.5``) or an
+                absolute count (``4``). Everything after is masked and filled,
+                which is the auto-continuation (续写) behaviour.
+            greedy / temperature: as in :meth:`cloze`.
+
+        Returns a dict with ``input`` (kept words + ``[MASK]`` tail), ``output``
+        (completed text) and ``original``, or ``None`` if unparseable.
+        """
+        tree = self.grammar.parse_sentence(sentence)
+        if tree is None:
+            return None
+        pairs = self._leaf_pairs(tree)
+        n = len(pairs)
+        cut = int(keep * n) if isinstance(keep, float) else int(keep)
+        cut = max(1, min(cut, n - 1))
+        original, filled, markup = self._fill_masked(
+            tree, list(range(cut, n)), greedy, temperature
+        )
+        return {
+            "input": " ".join(markup),
+            "output": " ".join(filled),
+            "original": " ".join(original),
+            "mask_indices": list(range(cut, n)),
+        }
+
     @torch.no_grad()
     def evaluate(self, trees: list[Node]) -> dict[str, float]:
         """Return held-out rule- and word-prediction accuracy.
@@ -176,7 +319,8 @@ class RvNNText(nn.Module):
     # -- training objective ------------------------------------------------
 
     def training_loss(
-        self, root: Node, recon_weight: float = 1.0, l2_weight: float = 0.0
+        self, root: Node, recon_weight: float = 1.0, l2_weight: float = 0.0,
+        mask_frac: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Return the training loss for one tree plus its component breakdown.
 
@@ -184,10 +328,24 @@ class RvNNText(nn.Module):
         embeddings (training the encoder); the reconstruction loss uses detached
         targets (training the decoder projections) so the two objectives cannot
         interact to collapse the embeddings.
+
+        When ``mask_frac > 0``, a random subset of leaves is masked (tree
+        analogue of BERT's MLM) and the word predictor must recover the masked
+        words from the *masked* bottom-up context, teaching cloze /
+        auto-completion.  Unmasked words, rule prediction and reconstruction
+        still use the clean embeddings, so evaluation accuracy is unaffected.
         """
         device = self.word_emb.weight.device
         true_h = self._encode_tree(root)
         root_h = true_h[id(root)]
+
+        # Masked pass: only for the word loss on masked leaves.
+        masked_ids: set[int] = set()
+        if mask_frac > 0:
+            for leaf, _ in self._leaf_pairs(root):
+                if random.random() < mask_frac:
+                    masked_ids.add(id(leaf))
+        masked_h = self._encode_tree_masked(root, masked_ids) if masked_ids else true_h
 
         rule_loss = torch.zeros((), device=device)
         word_loss = torch.zeros((), device=device)
@@ -209,9 +367,16 @@ class RvNNText(nn.Module):
             n_rule += 1
             for pos, child in enumerate(node.children):
                 if child.is_leaf:
-                    # Predict the child's word from the parent's embedding.
+                    # Predict the child's word from the parent's embedding. For
+                    # masked leaves the parent embedding comes from the masked
+                    # pass (the context the model must fill in from).
+                    h_parent = (
+                        masked_h[id(node)]
+                        if id(child) in masked_ids
+                        else h_node
+                    )
                     word_loss = word_loss + F.cross_entropy(
-                        self.word_predictors[child.symbol](h_node).unsqueeze(0),
+                        self.word_predictors[child.symbol](h_parent).unsqueeze(0),
                         torch.tensor([self.word_index[child.symbol][child.word]], device=device),
                     )
                     n_word += 1

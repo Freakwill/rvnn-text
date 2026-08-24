@@ -9,7 +9,7 @@ import torch
 
 from .checkpoint import save_checkpoint
 from .data import make_corpus, train_test_split
-from .grammar import DEFAULT_PRODUCTIONS, Grammar, Node
+from .grammar import DEFAULT_PRODUCTIONS, STORY_PRODUCTIONS, Grammar, Node
 from .model import RvNNText
 from .utils import get_device, set_seed
 
@@ -36,11 +36,15 @@ def train_model(
     lr: float = 1e-3,
     recon_weight: float = 1.0,
     l2_weight: float = 0.0,
+    mask_frac: float = 0.0,
     device: torch.device | None = None,
     sample_interval: int = 0,
     quiet: bool = False,
 ) -> tuple[RvNNText, list[float]]:
     """Train an RvNN text model on parse trees.
+
+    ``mask_frac`` randomly masks leaves during training (tree MLM) so the model
+    can later fill in masked words (cloze / auto-completion); 0 disables it.
 
     Returns the trained model (in ``train`` mode) and the list of per-epoch
     average training losses.
@@ -60,7 +64,10 @@ def train_model(
         epoch_recon = 0.0
         for tree in trees:
             optimizer.zero_grad(set_to_none=True)
-            loss, m = model.training_loss(tree, recon_weight=recon_weight, l2_weight=l2_weight)
+            loss, m = model.training_loss(
+                tree, recon_weight=recon_weight, l2_weight=l2_weight,
+                mask_frac=mask_frac,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -95,6 +102,8 @@ def main(
     lr: float = 1e-3,
     recon_weight: float = 1.0,
     l2_weight: float = 0.0,
+    mask_frac: float = 0.15,
+    story: bool = False,
     seed: int = 42,
     val_frac: float = 0.1,
     save: bool = True,
@@ -104,12 +113,16 @@ def main(
     """Train the RvNN text model and (optionally) save a checkpoint.
 
     Args:
-        num_sentences: number of synthetic sentences to generate for training.
+        num_sentences: number of synthetic trees to generate for training.
         epochs: number of passes over the corpus.
         dim: embedding dimension.
         lr: Adam learning rate.
         recon_weight: weight of the reconstruction term relative to CE terms.
         l2_weight: L2 regularization on word embeddings (0 to disable).
+        mask_frac: fraction of leaves masked per tree (tree MLM); enables
+            cloze / auto-completion after training. 0 disables masking.
+        story: train on multi-sentence story paragraphs instead of single
+            sentences (start symbol ``Story``).
         seed: random seed for corpus generation and weight init.
         val_frac: fraction of the corpus held out for validation.
         save: whether to write a checkpoint under ``out_dir``.
@@ -118,12 +131,13 @@ def main(
     """
     set_seed(seed)
     device = get_device()
-    grammar = Grammar(DEFAULT_PRODUCTIONS)
+    grammar = Grammar(STORY_PRODUCTIONS, start="Story") if story else Grammar(DEFAULT_PRODUCTIONS)
     corpus = make_corpus(grammar, num_sentences, seed=seed)
     train_trees, val_trees = train_test_split(corpus, val_frac=val_frac, seed=seed)
     print(
         f"corpus: {len(corpus)} trees "
-        f"({len(train_trees)} train / {len(val_trees)} val), device={device}"
+        f"({len(train_trees)} train / {len(val_trees)} val), "
+        f"start={grammar.start}, device={device}"
     )
 
     model, _ = train_model(
@@ -135,6 +149,7 @@ def main(
         lr=lr,
         recon_weight=recon_weight,
         l2_weight=l2_weight,
+        mask_frac=mask_frac,
         device=device,
         sample_interval=sample_interval,
     )
