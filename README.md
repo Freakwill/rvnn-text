@@ -635,6 +635,27 @@ python -m pytest
 | 实验二 | Stanford Sentiment Treebank (SST-5) | <https://nlp.stanford.edu/sentiment/> | 括号树 + 逐节点 0~4 情感标签，**无句法类别** |
 | 实验三 | **GENIA Treebank 1.0**（生物医学） | <http://bllip.cs.brown.edu/download/genia1.0-division-rel1.tar.gz> | PTB 风格成分树，**带完整句法类别**（S/NP/VP/PP…），14,326 train / 1,361 dev |
 
+### 数据格式示例（GENIA 成分树）
+
+实验三所用 GENIA 的每行是一棵**括号表示（PTB 风格）的成分树**：内部节点带句法类别
+（`S1`/`S`/`NP`/`VP`…），叶子为「词性 + 单词」。原始格式摘自 `train.trees` 第 132 行：
+
+```
+(S1 (S (S (NP (JJ High-risk) (NNS patients)) (VP (MD can) (VP (VB be) (VP (VBN recognized) (ADVP (RB morphologically))))) (. .))))
+```
+
+该行含 6 个实词——*High-risk patients can be recognized morphologically*（生物医学典型的被动句）。
+预处理后（剔除标点叶子、右分支二值化，即模型实际看到的树），绘制成树形图：
+
+![GENIA 成分树示例：High-risk patients can be recognized morphologically](assets/genia_tree.png)
+
+- **读取方式**：递归括号——`(类别 子节点…)`，叶子 `(词性 单词)`；词性标记含义：`JJ` 形容词、
+  `NNS` 复数名词、`MD` 情态动词、`VB`/`VBN` 动词原形/过去分词、`RB` 副词；
+- **预处理**：剔除 7 个标点词性（`.` `,` `:` `'` `` ` `` `-LRB-` `-RRB-`）→ 右分支二值化 →
+  词表过滤（`min_count=2`，OOV → `<unk>`）→ 转成 `rvnn_text.grammar.Node`；
+- **文法归纳**：从全部训练树统计产生式（如 `NP → JJ NNS`、`VP → VBN ADVP`），得到 **55 个类别 /
+  4635 条规则**——这正是实验三里 RvNN 学到的结构约束。
+
 ### 其他带明确文法结构的树库（已验证可达，未在本仓库使用）
 
 | 类型 | 数据 | 地址 | 说明 |
