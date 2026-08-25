@@ -204,6 +204,10 @@ class RvNNText(nn.Module):
             assert leaf.word is not None  # a leaf always carries a word
             original.append(leaf.word)
             if i in mask_indices:
+                if leaf.symbol not in self.word_predictors:  # unseen symbol
+                    filled.append(leaf.word)
+                    markup.append("[MASK]")
+                    continue
                 logits = self.word_predictors[leaf.symbol](true_h[id(parent)])
                 idx = self._sample(logits, temperature, greedy)
                 filled.append(self.preterm_words[leaf.symbol][idx])
@@ -345,14 +349,20 @@ class RvNNText(nn.Module):
                 if node.is_leaf:
                     return
                 h = true_h[id(node)]
-                pred = int(self.prod_predictors[node.symbol](h).argmax().item())
-                truth = self.rule_index[node.symbol][tuple(c.symbol for c in node.children)]
-                n_rule += 1
-                rule_correct += pred == truth
+                rules = self.rule_index.get(node.symbol)
+                truth = rules.get(tuple(c.symbol for c in node.children)) if rules else None
+                if truth is not None:            # rule seen in the training grammar
+                    pred = int(self.prod_predictors[node.symbol](h).argmax().item())
+                    n_rule += 1
+                    rule_correct += pred == truth
                 for child in node.children:
                     if child.is_leaf:
+                        assert child.word is not None
+                        wi = self.word_index.get(child.symbol)
+                        t = wi.get(child.word) if wi else None
+                        if t is None:            # symbol/word seen in training grammar
+                            continue
                         p = int(self.word_predictors[child.symbol](h).argmax().item())
-                        t = self.word_index[child.symbol][child.word]
                         n_word += 1
                         word_correct += p == t
                 for child in node.children:
@@ -408,16 +418,24 @@ class RvNNText(nn.Module):
                 return
             h_node = true_h[id(node)]
             rule = tuple(c.symbol for c in node.children)
-            rule_loss = rule_loss + F.cross_entropy(
-                self.prod_predictors[node.symbol](h_node).unsqueeze(0),
-                torch.tensor([self.rule_index[node.symbol][rule]], device=device),
-            )
-            n_rule += 1
+            rules = self.rule_index.get(node.symbol)
+            rule_idx = rules.get(rule) if rules else None
+            if rule_idx is not None:             # rule seen in the training grammar
+                rule_loss = rule_loss + F.cross_entropy(
+                    self.prod_predictors[node.symbol](h_node).unsqueeze(0),
+                    torch.tensor([rule_idx], device=device),
+                )
+                n_rule += 1
             for pos, child in enumerate(node.children):
                 if child.is_leaf:
                     # Predict the child's word from the parent's embedding. For
                     # masked leaves the parent embedding comes from the masked
                     # pass (the context the model must fill in from).
+                    assert child.word is not None
+                    wi = self.word_index.get(child.symbol)
+                    word_idx = wi.get(child.word) if wi else None
+                    if word_idx is None:         # symbol/word seen in training grammar
+                        continue
                     h_parent = (
                         masked_h[id(node)]
                         if id(child) in masked_ids
@@ -425,7 +443,7 @@ class RvNNText(nn.Module):
                     )
                     word_loss = word_loss + F.cross_entropy(
                         self.word_predictors[child.symbol](h_parent).unsqueeze(0),
-                        torch.tensor([self.word_index[child.symbol][child.word]], device=device),
+                        torch.tensor([word_idx], device=device),
                     )
                     n_word += 1
                 else:
@@ -504,6 +522,13 @@ class RvNNText(nn.Module):
             ]
             if candidates:
                 idx = candidates[int(logits[candidates].argmax().item())]
+            elif max_depth < -50:
+                # Hard termination guard for large real grammars: pick the rule
+                # with the fewest internal children so recursion bottoms out.
+                def _internals(r: tuple[str, ...]) -> int:
+                    return sum(1 for s in r if s not in self.preterminal_set)
+
+                idx = min(range(len(rules)), key=lambda i: (_internals(rules[i]), i))
             else:
                 idx = int(logits.argmax().item())
         else:

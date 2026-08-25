@@ -522,6 +522,77 @@ steered toward very positive (class 4):  . <unk> Breaking ultimately standards w
 > 而是递归生成成立的前提**。改进方向：换用带完整句法标注的树库（如 PTB 全标注），或用 TreeLSTM 类
 > 带门控的组合函数（见[扩展方向](#扩展方向)）。
 
+### 实验三：GENIA 真实成分树库上的结构约束生成（真实文法）
+
+实验二的失败点在于 SST 树**没有句法类别**。实验三换用 **GENIA Treebank**——带完整句法类别
+（`S`/`NP`/`VP`/`PP`…）的真实生物医学成分树——验证：有了真实文法约束，真实数据上的生成是否恢复。
+
+#### 1. 数据
+
+**GENIA Treebank 1.0**（生物医学 Medline 摘要，PTB 风格成分树）——来源与下载见[数据来源](#数据来源)
+（自动下载，约 1.5 MB）。规模：14,326 train / 1,361 dev；本实验使用 **2500 train / 400 dev**。
+预处理：解析括号树 → 剔除标点叶子（`.` `,` `:` 等 7 个标点词性）→ 右分支二值化 → 按 `min_count=2`
+过滤词表（OOV → `<unk>`）。
+
+#### 2. 实验步骤
+
+1. 由训练树**归纳真实文法**：内部类别保留原名（`S1 → S`、`NP → DT NN`、`NP → NP PP`…），
+   每个词性标签（`NN`/`DT`/`JJ`…）作为自己的前终结符（`NN → gene`、`DT → the`…）；
+   得到 **55 个类别、4635 条规则、3442 词**；
+2. 训练：与实验一同款递归自编码器目标（规则 CE + 单词 CE + 重构 + `mask_frac=0.15`），
+   `dim=64`、Adam（lr=1e-3）、8 epochs；
+3. 评估：held-out 规则/单词预测准确率；再执行自由生成、cloze、自动续写。
+
+复现命令：`python -m rvnn_text.genia --max_train 2500 --max_dev 400 --dim 64 --epochs 8`
+
+#### 3. 实验结果（Apple Silicon MPS）
+
+| 指标 | 数值 |
+|---|---|
+| held-out 规则预测准确率 | **88.2%**（4635 规则） |
+| held-out 单词预测准确率 | **90.1%** |
+| 训练损失 | 4.7526 → 1.1981（8 epochs） |
+
+**① Cloze 填空（结构固定，词预测）** —— 能补出**真实的生物医学术语**：
+
+```
+masked:  ... cells and <unk> acid [MASK] ... cells from human monocytes
+filled:  ... cells and <unk> acid okadaic ... cells from human monocytes     ← 术语 okadaic acid
+
+masked:  We previously showed that ... factor M-CSF [MASK] the differentiation of human monocytes ...
+filled:  We previously showed that ... factor M-CSF are the differentiation of human monocytes ...
+```
+
+**② 自动续写（结构固定，后半段全部 mask）** —— 生成语法正确的从句与名词短语：
+
+```
+masked:  We previously showed that ... colony-stimulating factor M-CSF [MASK] × 13
+filled:  We previously showed that ... colony-stimulating factor M-CSF <unk> the protein of <unk> cells of patients
+
+masked:  However in vivo not only <unk> but also [MASK] × 8
+filled:  However in vivo not only <unk> but also <unk> cells are <unk> of <unk> cells
+```
+
+**③ 自由生成（结构也由模型采样）** —— 词汇全部真实（生物医学词表），但**结构开始漂移**：
+
+```
+These levels had Neither This studied out <unk> Most long-term heavy-chain DNAs toward vs. ...
+p65 bcl-2 <unk>
+integrity TNF line by a aging activated diffuse capacity in disease a status climacteric palindrome
+```
+
+> **结论（教学点）**：三个实验构成完整对照——**文法约束的"剂量"决定生成质量**：
+>
+> | 实验 | 文法约束 | 自由生成效果 |
+> |---|---|---|
+> | 一（玩具文法） | 规则准确率 100%，规则集小 | 句子 100% 合法 |
+> | 二（SST，无类别） | 零约束 | 词汤 |
+> | 三（GENIA 真实文法） | 规则准确率 88%，规则集 4635 条 | 词汇真实、结构漂移 |
+>
+> 而**结构固定**的任务（cloze / 续写）在三中表现良好——说明解码器已学会"按结构选词"，自由生成的
+> 漂移主要来自**规则预测的剩余误差**与**缺少句子长度先验**。提升方向：更多数据/epochs 提高规则
+> 准确率、加入长度控制（如先采样句子长度再解码）、TreeLSTM 门控组合（见[扩展方向](#扩展方向)）。
+
 ---
 
 ## 项目结构
@@ -535,6 +606,7 @@ rvnn-text/
 │   ├── train.py        # 训练循环（fire CLI）
 │   ├── generate.py     # 生成（fire CLI）
 │   ├── sst.py          # 实验二：SST-5 真实语料情感分析（判别式 RvNN，fire CLI）
+│   ├── genia.py        # 实验三：GENIA 真实成分树库上的结构约束生成（fire CLI）
 │   ├── demo.py         # 端到端演示（fire CLI）
 │   ├── checkpoint.py   # 模型保存 / 加载
 │   └── utils.py        # 设备选择、随机种子
@@ -553,21 +625,31 @@ python -m pytest
 
 ## 数据来源
 
-**本项目演示所用的语料是合成的**：由内置文法（`DEFAULT_PRODUCTIONS` / `STORY_PRODUCTIONS`，
-见 `rvnn_text/grammar.py`）随机采样生成，零下载、可复现（`seed` 固定）。好处是每棵树都带有完整
-的句法标注，且语料规模任意可调；代价是词汇与句法都受限在文法之内。
+**实验一（合成）**：语料由内置文法（`DEFAULT_PRODUCTIONS` / `STORY_PRODUCTIONS`，见
+`rvnn_text/grammar.py`）随机采样生成，零下载、可复现（`seed` 固定）；每棵树带完整句法标注。
 
-> ⚠️ 外部数据源中，**仅 SST（实验二）在本仓库的实验中实际使用**（自动下载
-> <https://nlp.stanford.edu/sentiment/trainDevTestTrees_PTB.zip>）；其余（UCI / Kaggle / IEEE
-> DataPort / Project Gutenberg）**均未使用**，仅作为日后换用更多真实语料的参考：
+**实验二 / 三（真实）**：
 
-| 来源 | 地址 | 说明 |
-|---|---|---|
-| UCI Machine Learning Repository | <https://archive.ics.uci.edu/> | 经典机器学习数据集 |
-| Kaggle | <https://www.kaggle.com/> | 竞赛与社区数据集 |
-| IEEE DataPort | <https://ieee-dataport.org/> | 科研数据集（IEEE 官方） |
-| Stanford Sentiment Treebank | <https://nlp.stanford.edu/sentiment/> | 成分句法树 + 逐节点情感标签，RvNN 经典基准 |
-| Project Gutenberg | <https://www.gutenberg.org/> | 公有领域故事 / 诗歌全文，可从中抽取词汇与句式来扩写自定义文法 |
+| 实验 | 数据 | 地址（自动下载） | 说明 |
+|---|---|---|---|
+| 实验二 | Stanford Sentiment Treebank (SST-5) | <https://nlp.stanford.edu/sentiment/> | 括号树 + 逐节点 0~4 情感标签，**无句法类别** |
+| 实验三 | **GENIA Treebank 1.0**（生物医学） | <http://bllip.cs.brown.edu/download/genia1.0-division-rel1.tar.gz> | PTB 风格成分树，**带完整句法类别**（S/NP/VP/PP…），14,326 train / 1,361 dev |
+
+### 其他带明确文法结构的树库（已验证可达，未在本仓库使用）
+
+| 类型 | 数据 | 地址 | 说明 |
+|---|---|---|---|
+| 成分树 | BLLIP-LSA（Brown） | <http://bllip.cs.brown.edu/download/> | 华尔街日报+北美人报，PTB 风格带类别；树库本体需研究注册 / LDC 付费（页面上的 tar 为解析器模型） |
+| 成分树 | TIGER 语料库（德语） | <https://www.ims.uni-stuttgart.de/forschung/ressourcen/korpora/tiger/> | 约 4 万句德语成分树，研究许可 |
+| 成分树 | GENIA（生物医学） | <http://www.geniaproject.org/> | 本仓库实验三所用，官方项目主页 |
+| 成分树 | Penn Treebank (PTB) | <https://catalog.ldc.upenn.edu/LDC99T42> | 黄金标准，**LDC 付费** |
+| 依存树 | Universal Dependencies v2.18 | <https://universaldependencies.org/>（发布包 <https://lindat.mff.cuni.cz/repository/xmlui/handle/11234/1-6149>） | 100+ 语言（含中文），完全免费、无注册，主谓/动宾等依存关系 |
+| 依存树 | Perseus 古典语树库 | <https://perseusdl.github.io/treebank_data/> | 古希腊语 / 拉丁语，免费 |
+| 依存树 | BulTreeBank（保加利亚语） | <http://bultreebank.org/> | 免费 |
+
+> 通用数据站（UCI <https://archive.ics.uci.edu/> / Kaggle <https://www.kaggle.com/> / IEEE DataPort
+> <https://ieee-dataport.org/>）以机器学习任务数据为主，**不含句法树**，本仓库实验未使用；若要给任意
+> 纯文本生成句法树，可用现成 parser（Stanford Parser / Berkeley Parser / spaCy）。
 
 接入真实数据的方法：把外部语料的成分句法树转换成 `rvnn_text.grammar.Node`（叶子为词性 + 单词，
 内部节点为短语类别），再复用 `train_model` 即可。若只有裸文本（无句法标注），可先用现成 parser
@@ -579,8 +661,8 @@ python -m pytest
 
 - **变分先验（VAE）**：当前的生成先验是"可学习均值向量 + 高斯噪声"，解码会偏向某个区域。
   改为变分自编码器（对根向量学习均值/方差并加 KL 正则）可得到平滑、可控的生成分布。
-- **真实数据（已实现）**：实验二已在 SST-5 上做根节点情感分类（见[实验](#实验)）；进一步可用全量
-  8544 句、更大 dim 与预训练词向量提升准确率，并评估**短语级**情感（SST 每个节点都有标签）。
+- **真实数据（已实现）**：实验二在 SST-5 上做根节点情感分类、实验三在 GENIA 成分树库上做结构约束
+  生成（见[实验](#实验)）；进一步可用全量 GENIA/PTB、更大 dim 与预训练词向量提升质量。
 - **递归批处理**：当前按树逐个训练；对同构子树做批处理（如 TreeLSTM 的批处理技巧）可显著加速。
 - **更丰富的组合函数**：如 Recursive Neural Tensor Network（Socher 2013）、Gated RvNN（TreeLSTM）。
 - **任意文法**：`Grammar` 支持自定义产生式（arity ≤ 2），可直接换成中文、代码或 SQL 的文法。

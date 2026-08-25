@@ -75,6 +75,7 @@ class Grammar:
         self,
         productions: dict[str, list[tuple[str, ...]]] | None = None,
         start: str = "S",
+        preterminals: list[str] | None = None,
     ) -> None:
         if productions is None:
             productions = DEFAULT_PRODUCTIONS
@@ -83,14 +84,20 @@ class Grammar:
         }
         self.start = start
         self.nonterminals: list[str] = sorted(self.productions)
-        preterminal_set = {
-            lhs
-            for lhs, rules in self.productions.items()
-            if all(len(rhs) == 1 and rhs[0] not in self.productions for rhs in rules)
-        }
-        self.preterminals: list[str] = sorted(preterminal_set)
+        if preterminals is not None:
+            # Explicit classification (from a treebank): symbols that occur as
+            # leaves are preterminals even when a word equals a symbol name
+            # (e.g. ``. -> .``), which the rule-shape heuristic cannot tell apart.
+            self.preterminals: list[str] = sorted(preterminals)
+        else:
+            preterminal_set = {
+                lhs
+                for lhs, rules in self.productions.items()
+                if all(len(rhs) == 1 and rhs[0] not in self.productions for rhs in rules)
+            }
+            self.preterminals = sorted(preterminal_set)
         self.internal: list[str] = [
-            x for x in self.nonterminals if x not in preterminal_set
+            x for x in self.nonterminals if x not in self.preterminals
         ]
         self.words: list[str] = sorted(
             {rhs[0] for lhs in self.preterminals for rhs in self.productions[lhs]}
