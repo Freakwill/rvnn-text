@@ -23,6 +23,7 @@ dev = ["pytest>=7.0"]
 rvnn-train = "rvnn_text.train:cli"
 rvnn-generate = "rvnn_text.generate:cli"
 rvnn-demo = "rvnn_text.demo:cli"
+rvnn-sst = "rvnn_text.sst:cli"
 
 [tool.setuptools.packages.find]
 include = ["rvnn_text*"]

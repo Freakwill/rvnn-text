@@ -1,19 +1,8 @@
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.eggs/
-.venv/
-venv/
-env/
-dist/
-build/
+# data (SST trees are downloaded on demand, not committed)
+data/
+
+# training artifacts
 checkpoints/
-*.pt
-*.pth
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+__pycache__/
+*.pyc
 .DS_Store
-.idea/
-.vscode/

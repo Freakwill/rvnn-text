@@ -20,12 +20,14 @@ class Node:
     A leaf node represents a preterminal that directly yields a word: it has
     ``word`` set and no children (e.g. ``Node("Noun", word="cat")``). An
     internal node has ``word=None`` and one or two child ``Node`` objects
-    (e.g. ``Node("S", children=[np, vp])``).
+    (e.g. ``Node("S", children=[np, vp])``). ``label`` optionally carries a
+    per-node class label (e.g. SST sentiment) for supervised training.
     """
 
     symbol: str
     word: str | None = None
     children: list["Node"] = field(default_factory=list)
+    label: int | None = None
 
     @property
     def is_leaf(self) -> bool:

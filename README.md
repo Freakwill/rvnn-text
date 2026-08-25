@@ -378,7 +378,9 @@ generated: a red tree chases the happy boy. the red happy tree sees slowly.
 
 ## 实验
 
-### 1. 实验步骤
+### 实验一：合成语料上的文法约束生成（递归自编码器）
+
+#### 1. 实验步骤
 
 1. **数据生成**：`make_corpus(grammar, 1500, seed=42)` 从内置故事文法采样 1500 棵故事树，按 9:1
    划分 train/val（`seed` 固定，完全可复现）。
@@ -390,7 +392,7 @@ generated: a red tree chases the happy boy. the red happy tree sees slowly.
 
 复现命令：`python -m rvnn_text.demo`（即执行上述全部步骤）。
 
-### 2. 数据说明
+#### 2. 数据说明
 
 | 项 | 内容 |
 |---|---|
@@ -422,7 +424,7 @@ Story
 对应代码结构：叶子 `Node("Noun", word="tree")`；内部节点 `Node("NP", children=[...])`。训练语料即
 `list[Node]`；要换真实数据，只需把外部语料的成分句法树转成同样的 `Node` 表示（见[数据来源](#数据来源)）。
 
-### 3. 实验结果
+#### 3. 实验结果
 
 - **文法内化**：held-out 规则预测准确率 **100%**、单词预测准确率 **100%**。训练 20 epochs 总损失
   `0.5316 → 0.2932`，规则损失第 9 个 epoch 归零，重构损失 `0.1351 → 0.0246`；
@@ -434,6 +436,53 @@ Story
   `every clever girl likes a cat. every tree eats the happy tree. a small small clever tree sees loudly.`）。
 
 完整实测输出见[演示结果](#演示结果)。
+
+### 实验二：SST-5 真实语料情感分析（判别式 RvNN）
+
+#### 1. 数据
+
+**Stanford Sentiment Treebank（SST-5）**——RvNN 的经典真实数据基准（Socher et al., 2013）：
+<https://nlp.stanford.edu/sentiment/>
+
+- **格式**：每行一棵括号树，每个节点带 0~4 情感标签（0 极负面 → 4 极正面），叶子为单词——
+  内部节点**不含**句法类别符号（只有情感标签与结构），例如
+  `(3 (2 (2 The) (2 Rock)) (4 (3 (2 is) (2 destined)) (2 .)))`；
+- **规模**：8544 train / 1101 dev / 2210 test 句；本实验使用子集 **1500 train / 400 dev**（
+  `--max_train` / `--max_dev` 可调）；
+- 数据在首次运行时自动下载（`data/sst/trees.zip`，约 0.8 MB，不进入 git）。
+
+#### 2. 实验步骤
+
+1. 解析括号树 → 右分支**二值化**（n 元节点折叠为二叉脊，新节点继承父节点情感标签）；
+2. 由训练树**归纳通用文法**：所有内部节点统一符号 `N`（`N → N N | W N | N W | W W | W`），
+   叶子词性统一为 `W`（`W → 任意词`，OOV 映射为 `<unk>`）；
+3. 训练：RvNN 编码器 + 5 类情感头，对**每个节点**的向量做情感交叉熵（Socher 式逐节点监督），
+   `dim=32`、Adam（lr=1e-3）、5 epochs；
+4. 评估：**根节点**预测准确率 vs 多数类基线。
+
+复现命令：`python -m rvnn_text.sst --max_train 1500 --max_dev 400 --dim 32 --epochs 5`
+
+#### 3. 实验结果（Apple Silicon MPS）
+
+| 指标 | 数值 |
+|---|---|
+| 多数类基线（恒预测类别 3） | 45.75% |
+| **RvNN 根节点情感准确率** | **48.50%** |
+| 训练损失 | 1.0098 → 0.5964（5 epochs） |
+
+示例预测（dev）：
+
+```
+[ok ] It 's a lovely film with lovely performances ...      true=3 pred=3
+[ok ] A warm , funny , engaging film .                      true=4 pred=4
+[ok ] Visually imaginative , ... and thoroughly delightful  true=4 pred=4
+[mis] No one goes ... here , which is probably for the best. true=2 pred=3
+```
+
+> 说明：真实树没有句法类别（只有情感标签），因此实验二用的是**无类别共享组合函数**的判别式 RvNN
+> （与实验一的文法约束解码互补）。在 1500 句的小子集上，RvNN 以 +2.75 个百分点超过多数类基线；
+> 用全量 8544 句、更大 dim 与更多 epochs 可进一步提升。另外，归纳出的 `N → N N` 文法天然左递归，
+> 本实验只使用**编码**路径（树结构给定），不涉及 `Grammar.parse()`（后者要求文法无左递归）。
 
 ---
 
@@ -447,6 +496,7 @@ rvnn-text/
 │   ├── data.py         # 从文法生成语料、train/val 划分
 │   ├── train.py        # 训练循环（fire CLI）
 │   ├── generate.py     # 生成（fire CLI）
+│   ├── sst.py          # 实验二：SST-5 真实语料情感分析（判别式 RvNN，fire CLI）
 │   ├── demo.py         # 端到端演示（fire CLI）
 │   ├── checkpoint.py   # 模型保存 / 加载
 │   └── utils.py        # 设备选择、随机种子
@@ -469,8 +519,9 @@ python -m pytest
 见 `rvnn_text/grammar.py`）随机采样生成，零下载、可复现（`seed` 固定）。好处是每棵树都带有完整
 的句法标注，且语料规模任意可调；代价是词汇与句法都受限在文法之内。
 
-> ⚠️ 下方列出的外部数据源**均未在本实验中使用**（本实验只用上述合成语料），仅作为日后换用真实语料
-> 的参考。若需要接入真实数据（尤其是带句法标注的），可参考（SST 与 RvNN 主题最契合）：
+> ⚠️ 外部数据源中，**仅 SST（实验二）在本仓库的实验中实际使用**（自动下载
+> <https://nlp.stanford.edu/sentiment/trainDevTestTrees_PTB.zip>）；其余（UCI / Kaggle / IEEE
+> DataPort / Project Gutenberg）**均未使用**，仅作为日后换用更多真实语料的参考：
 
 | 来源 | 地址 | 说明 |
 |---|---|---|
@@ -490,7 +541,8 @@ python -m pytest
 
 - **变分先验（VAE）**：当前的生成先验是"可学习均值向量 + 高斯噪声"，解码会偏向某个区域。
   改为变分自编码器（对根向量学习均值/方差并加 KL 正则）可得到平滑、可控的生成分布。
-- **真实数据**：在 SST 上训练，做短语级情感分析。
+- **真实数据（已实现）**：实验二已在 SST-5 上做根节点情感分类（见[实验](#实验)）；进一步可用全量
+  8544 句、更大 dim 与预训练词向量提升准确率，并评估**短语级**情感（SST 每个节点都有标签）。
 - **递归批处理**：当前按树逐个训练；对同构子树做批处理（如 TreeLSTM 的批处理技巧）可显著加速。
 - **更丰富的组合函数**：如 Recursive Neural Tensor Network（Socher 2013）、Gated RvNN（TreeLSTM）。
 - **任意文法**：`Grammar` 支持自定义产生式（arity ≤ 2），可直接换成中文、代码或 SQL 的文法。
