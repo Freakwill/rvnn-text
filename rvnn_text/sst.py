@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .grammar import Grammar, Node, flatten
+from .grammar import Grammar, Node, flatten, to_sentence
 from .model import RvNNText
 from .utils import get_device, set_seed
 
@@ -169,7 +169,13 @@ def build_grammar(train_trees: list[Node]) -> Grammar:
 # -- model -----------------------------------------------------------------
 
 class SentimentRvNN(nn.Module):
-    """RvNN encoder + root/global sentiment head (Socher-style discriminative RvNN)."""
+    """RvNN encoder + root/global sentiment head (Socher-style discriminative RvNN).
+
+    When ``aux_weight > 0`` the loss additionally trains the built-in RvNN
+    decoder (rule/word cross-entropy + reconstruction), so the model can also
+    *generate* text (recursive autoencoder), optionally steered toward a target
+    sentiment class.
+    """
 
     def __init__(self, grammar: Grammar, dim: int = 32, num_classes: int = 5) -> None:
         super().__init__()
@@ -181,8 +187,8 @@ class SentimentRvNN(nn.Module):
         for c in root.children:
             yield from self._nodes(c)
 
-    def loss(self, root: Node) -> torch.Tensor:
-        """Mean sentiment cross-entropy over all labelled nodes."""
+    def loss(self, root: Node, aux_weight: float = 0.5) -> torch.Tensor:
+        """Sentiment CE over all labelled nodes + RAE decoder objective."""
         hs = self.encoder._encode_tree(root)
         total = torch.zeros((), device=self.encoder.word_emb.weight.device)
         n = 0
@@ -193,12 +199,66 @@ class SentimentRvNN(nn.Module):
             target = torch.tensor([node.label], device=logits.device)
             total = total + F.cross_entropy(logits, target)
             n += 1
-        return total / max(n, 1)
+        sent = total / max(n, 1)
+        if aux_weight > 0:
+            aux, _ = self.encoder.training_loss(root)
+            return sent + aux_weight * aux
+        return sent
 
     @torch.no_grad()
     def predict_root(self, root: Node) -> int:
         h = self.encoder.encode(root)
         return int(self.head(h).argmax().item())
+
+    @torch.no_grad()
+    def generate(self, target_class: int | None = None, temperature: float = 0.9,
+                 max_depth: int = 18, steer: float = 2.0,
+                 seed_noise: float = 1.0) -> Node:
+        """Generate a tree; ``target_class`` steers toward a sentiment class.
+
+        Steering mechanism: the root vector starts at the learned start vector
+        plus ``steer * head.weight[target_class]`` — the sentiment head's row
+        for that class — so decoding follows the direction that maximises that
+        class's logit (activation steering).  ``None`` generates unconditionally.
+        """
+        if target_class is None:
+            return self.encoder.generate(
+                temperature=temperature, max_depth=max_depth, seed_noise=seed_noise)
+        h = self.encoder.start_embedding + steer * self.head.weight[target_class]
+        h = h + seed_noise * torch.randn_like(h)
+        return self.encoder.generate(
+            temperature=temperature, max_depth=max_depth, root_embedding=h)
+
+    @torch.no_grad()
+    def scaffold_generate(self, skeleton: Node, temperature: float = 0.9,
+                          greedy: bool = False, root_embedding: torch.Tensor | None = None) -> Node:
+        """Regenerate the words of a tree along its structure skeleton.
+
+        The skeleton (a real SST tree's N/W shape) fixes the *structure* —
+        which is what the label-only SST trees lack — while the decoder
+        re-chooses every word: top-down, each internal node projects its
+        embedding with ``D_left``/``D_right`` and each leaf's word is sampled
+        from the word predictor.  This is structure-conditioned generation:
+        real sentence shapes, model-chosen words.
+        """
+        if root_embedding is None:
+            h = self.encoder.start_embedding + 0.5 * torch.randn_like(self.encoder.start_embedding)
+        else:
+            h = root_embedding
+
+        def rec(skel: Node, h: torch.Tensor) -> Node:
+            children: list[Node] = []
+            for pos, child_skel in enumerate(skel.children):
+                if child_skel.is_leaf:                       # W -> sample a word
+                    logits = self.encoder.word_predictors[PRETERM](h)
+                    idx = self.encoder._sample(logits, temperature, greedy)
+                    children.append(Node(PRETERM, word=self.encoder.preterm_words[PRETERM][idx]))
+                else:                                        # N -> project and recurse
+                    h_child = self.encoder.D_left(h) if pos == 0 else self.encoder.D_right(h)
+                    children.append(rec(child_skel, h_child))
+            return Node(INTERNAL, children=children)
+
+        return rec(skeleton, h)
 
 
 # -- training --------------------------------------------------------------
@@ -209,6 +269,7 @@ def train_model(
     dev_trees: list[Node],
     epochs: int = 5,
     lr: float = 1e-3,
+    aux_weight: float = 0.5,
     device: torch.device | None = None,
 ) -> list[float]:
     """Train the sentiment RvNN; report dev root accuracy each epoch."""
@@ -222,7 +283,7 @@ def train_model(
         epoch_loss = 0.0
         for tree in trees:
             opt.zero_grad(set_to_none=True)
-            loss = model.loss(tree)
+            loss = model.loss(tree, aux_weight=aux_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
@@ -246,15 +307,25 @@ def accuracy(model: SentimentRvNN, trees: list[Node], device: torch.device) -> f
 
 def main(
     data_dir: str = "data/sst",
-    max_train: int = 1500,
+    max_train: int = 2000,
     max_dev: int = 400,
-    dim: int = 32,
-    epochs: int = 5,
+    dim: int = 64,
+    epochs: int = 6,
     lr: float = 1e-3,
     min_word_count: int = 2,
+    aux_weight: float = 0.3,
+    n_gen: int = 3,
+    n_scaffold: int = 4,
+    steer: float = 3.0,
     seed: int = 42,
 ) -> None:
-    """Train an RvNN sentiment classifier on a subset of SST-5."""
+    """Train an RvNN sentiment classifier on a subset of SST-5.
+
+    ``aux_weight > 0`` also trains the decoder (rule/word CE + reconstruction),
+    enabling text generation — free samples, sentiment-steered samples
+    (``n_gen`` each), and structure-scaffold regeneration of real SST sentences
+    (``n_scaffold``).
+    """
     set_seed(seed)
     device = get_device()
     trees_dir = ensure_data(data_dir)
@@ -274,7 +345,8 @@ def main(
           f"grammar rules: N={len(grammar.productions['N'])}")
 
     model = SentimentRvNN(grammar, dim=dim)
-    train_model(model, train_trees, dev_trees, epochs=epochs, lr=lr, device=device)
+    train_model(model, train_trees, dev_trees, epochs=epochs, lr=lr,
+                aux_weight=aux_weight, device=device)
 
     # majority-class baseline
     majority = Counter(t.label for t in train_trees).most_common(1)[0][0]
@@ -290,6 +362,40 @@ def main(
         mark = "ok " if pred == tree.label else "mis"
         sent = " ".join(flatten(tree))
         print(f"  [{mark}] {sent[:58]:58s} true={tree.label} pred={pred}")
+
+    if n_gen > 0 or n_scaffold > 0:
+        print()
+        print("=" * 70)
+        print("Generation from the SST-trained RvNN (recursive autoencoder)")
+        print("=" * 70)
+    if n_gen > 0:
+        print("free samples (learned start vector + noise; no syntactic categories,")
+        print("so the output is an unconstrained word stream):")
+        for _ in range(n_gen):
+            tree = model.generate(temperature=0.9)
+            print(f"  {to_sentence(tree):70s} (pred={model.predict_root(tree)})")
+        for cls, name in [(0, "steered toward very negative (class 0)"),
+                          (4, "steered toward very positive (class 4)")]:
+            print(f"\n{name}:")
+            for _ in range(n_gen):
+                tree = model.generate(target_class=cls, steer=steer, temperature=0.9)
+                print(f"  {to_sentence(tree):70s} (pred={model.predict_root(tree)})")
+    if n_scaffold > 0:
+        print(f"\nstructure-scaffold regeneration (real SST tree shapes, "
+              f"model-chosen words, temperature=0.3):")
+        for tree in dev_trees[:n_scaffold]:
+            regen = model.scaffold_generate(tree, temperature=0.3)
+            print(f"  original: {to_sentence(tree)}")
+            print(f"  regen:    {to_sentence(regen)}")
+            print()
+        scaffold = dev_trees[0]
+        for cls, name in [(0, "scaffold steered toward very negative (class 0)"),
+                          (4, "scaffold steered toward very positive (class 4)")]:
+            h = model.encoder.start_embedding + steer * model.head.weight[cls]
+            regen = model.scaffold_generate(scaffold, temperature=0.3, root_embedding=h)
+            print(f"{name}:")
+            print(f"  {to_sentence(regen)}")
+            print()
 
 
 if __name__ == "__main__":

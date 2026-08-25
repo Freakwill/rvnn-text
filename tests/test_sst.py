@@ -56,3 +56,60 @@ def test_build_grammar_generic_symbols():
     assert g.preterminals == ["W"]
     assert ("W",) in g.productions["N"]        # unary rule for single words
     assert ("a",) in g.productions["W"]
+
+
+def test_generate_produces_vocab_words():
+    """A decoder-trained SST model can generate (all words in the vocab)."""
+    import torch
+
+    from rvnn_text.sst import SentimentRvNN
+
+    trees = [binarize(parse_tree(t)) for t in [
+        "(4 (3 (2 a) (3 good) (3 film)) (2 .))",
+        "(1 (2 bad) (2 movie))",
+        "(2 (2 the) (3 (2 boring) (3 plot)))",
+        "(3 (2 it) (3 (2 works) (2 fine)))",
+        "(0 (2 terrible) (3 (2 and) (3 boring)))",
+    ]]
+    g = build_grammar(trees)
+    model = SentimentRvNN(g, dim=16)
+    # a few steps of decoder training so the start vector is anchored
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    for _ in range(30):
+        opt.zero_grad(set_to_none=True)
+        model.loss(trees[0], aux_weight=1.0).backward()
+        opt.step()
+    model.eval()
+    with torch.no_grad():
+        tree = model.generate(max_depth=10, temperature=1.0)
+        assert all(w in g.words for w in flatten(tree))
+        pos = model.generate(target_class=4, steer=1.0, max_depth=10, temperature=1.0)
+        assert all(w in g.words for w in flatten(pos))
+
+
+def test_scaffold_generate_matches_structure():
+    """Scaffold generation keeps the skeleton's shape but re-chooses words."""
+    import torch
+
+    from rvnn_text.sst import SentimentRvNN
+
+    trees = [binarize(parse_tree(t)) for t in [
+        "(4 (3 (2 a) (3 good) (3 film)) (2 .))",
+        "(1 (2 bad) (2 movie))",
+        "(2 (2 the) (3 (2 boring) (3 plot)))",
+        "(3 (2 it) (3 (2 works) (2 fine)))",
+        "(0 (2 terrible) (3 (2 and) (3 boring)))",
+    ]]
+    g = build_grammar(trees)
+    model = SentimentRvNN(g, dim=16)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    for _ in range(30):
+        opt.zero_grad(set_to_none=True)
+        model.loss(trees[0], aux_weight=1.0).backward()
+        opt.step()
+    model.eval()
+    with torch.no_grad():
+        regen = model.scaffold_generate(trees[0], temperature=1.0)
+        # same number of words (same skeleton), all in-vocab
+        assert len(flatten(regen)) == len(flatten(trees[0]))
+        assert all(w in g.words for w in flatten(regen))

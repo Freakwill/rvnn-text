@@ -447,7 +447,7 @@ Story
 - **格式**：每行一棵括号树，每个节点带 0~4 情感标签（0 极负面 → 4 极正面），叶子为单词——
   内部节点**不含**句法类别符号（只有情感标签与结构），例如
   `(3 (2 (2 The) (2 Rock)) (4 (3 (2 is) (2 destined)) (2 .)))`；
-- **规模**：8544 train / 1101 dev / 2210 test 句；本实验使用子集 **1500 train / 400 dev**（
+- **规模**：8544 train / 1101 dev / 2210 test 句；本实验使用子集 **2000 train / 400 dev**（
   `--max_train` / `--max_dev` 可调）；
 - 数据在首次运行时自动下载（`data/sst/trees.zip`，约 0.8 MB，不进入 git）。
 
@@ -457,32 +457,70 @@ Story
 2. 由训练树**归纳通用文法**：所有内部节点统一符号 `N`（`N → N N | W N | N W | W W | W`），
    叶子词性统一为 `W`（`W → 任意词`，OOV 映射为 `<unk>`）；
 3. 训练：RvNN 编码器 + 5 类情感头，对**每个节点**的向量做情感交叉熵（Socher 式逐节点监督），
-   `dim=32`、Adam（lr=1e-3）、5 epochs；
-4. 评估：**根节点**预测准确率 vs 多数类基线。
+   并叠加解码器目标（规则/单词 CE + 重构，`aux_weight=0.3`）使模型**同时具备生成能力**；
+   `dim=64`、Adam（lr=1e-3）、6 epochs；
+4. 评估：**根节点**预测准确率 vs 多数类基线，并考察生成效果。
 
-复现命令：`python -m rvnn_text.sst --max_train 1500 --max_dev 400 --dim 32 --epochs 5`
+复现命令：`python -m rvnn_text.sst`（默认参数即上述设置；纯情感训练用 `--aux_weight 0`）
 
 #### 3. 实验结果（Apple Silicon MPS）
 
 | 指标 | 数值 |
 |---|---|
 | 多数类基线（恒预测类别 3） | 45.75% |
-| **RvNN 根节点情感准确率** | **48.50%** |
-| 训练损失 | 1.0098 → 0.5964（5 epochs） |
+| **RvNN 根节点情感准确率**（含解码器训练） | **46.25%**（epoch 5 峰值 50.25%） |
+| 纯情感训练（`--aux_weight 0`）可达 | 48.50% |
+| 训练损失 | 2.3019 → 0.8540（6 epochs） |
+
+> 情感与解码器目标存在权衡：`aux_weight=0.3` 时分类略降（46.25%），但换来生成能力；只做情感分类
+> 可用 `--aux_weight 0`（48.50%，见上表）。
 
 示例预测（dev）：
 
 ```
-[ok ] It 's a lovely film with lovely performances ...      true=3 pred=3
 [ok ] A warm , funny , engaging film .                      true=4 pred=4
 [ok ] Visually imaginative , ... and thoroughly delightful  true=4 pred=4
-[mis] No one goes ... here , which is probably for the best. true=2 pred=3
+[ok ] And if you 're not nearly moved to tears ...          true=3 pred=3
+[mis] It 's a lovely film with lovely performances ...      true=3 pred=4
 ```
 
-> 说明：真实树没有句法类别（只有情感标签），因此实验二用的是**无类别共享组合函数**的判别式 RvNN
-> （与实验一的文法约束解码互补）。在 1500 句的小子集上，RvNN 以 +2.75 个百分点超过多数类基线；
-> 用全量 8544 句、更大 dim 与更多 epochs 可进一步提升。另外，归纳出的 `N → N N` 文法天然左递归，
-> 本实验只使用**编码**路径（树结构给定），不涉及 `Grammar.parse()`（后者要求文法无左递归）。
+#### 4. 生成任务：判别式 RvNN 能生成吗？（能，但质量受"无句法类别"制约）
+
+训练时同步训练了解码器（RAE 目标），因此模型**可以自顶向下生成**。但生成质量恰好反衬出文法约束
+对 RvNN 的关键作用（对比[实验一](#实验一合成语料上的文法约束生成递归自编码器)）：
+
+**① 自由生成**（可学习起始向量 + 噪声）——SST 树没有句法类别，归纳文法对结构**零约束**，
+解码器只能输出无序词流：
+
+```
+disturbing cartoon <unk> carries distant Silence children and and Jagger
+Makes with with
+```
+
+**② 结构脚手架生成**（真实 SST 树形骨架 + 模型选词，温度 0.3）——句子**形状**是真实的，
+单词由模型按电影评论风格挑选（近贪心取高概率词），但词序仍不成句：
+
+```
+original: It 's a lovely film with lovely performances by <unk> and <unk> .
+regen:    . <unk> suggest pure <unk> it fails pleasingly intriguing Schmidt charisma Meyjes .
+
+original: No one goes <unk> here , which is probably for the best .
+regen:    and compelling <unk> consider Leigh universal <unk> Perhaps enjoyable real good excellent .
+```
+
+**③ 情感引导的脚手架生成**——把情感头第 0/4 类的权重方向加到根向量（activation steering），
+**词汇层面的情感倾向清晰可见**（同一条真实句形）：
+
+```
+steered toward very negative (class 0):  . short its utterly wonder . hell Huppert killer along feature Korean .
+steered toward very positive (class 4):  . <unk> Breaking ultimately standards wonderful 's and feeling subtlety feeling punch .
+```
+
+> **结论（教学点）**：RvNN 的生成质量与文法约束强绑定——实验一有文法（`S → NP VP` …）约束每一步
+> 展开，生成 100% 合法；SST 标签树**没有句法类别**，归纳文法退化为"任意二叉"，解码器没有结构先验，
+> 于是自由生成退化为词流。这正是"RvNN 与文法分析不可分割"的另一面：**结构约束（语法）不是装饰，
+> 而是递归生成成立的前提**。改进方向：换用带完整句法标注的树库（如 PTB 全标注），或用 TreeLSTM 类
+> 带门控的组合函数（见[扩展方向](#扩展方向)）。
 
 ---
 
