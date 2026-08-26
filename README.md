@@ -588,12 +588,76 @@ integrity TNF line by a aging activated diffuse capacity in disease a status cli
 > | 一（玩具文法） | 规则准确率 100%，规则集小 | 句子 100% 合法 |
 > | 二（SST，无类别） | 零约束 | 词汤 |
 > | 三（GENIA 真实文法） | 规则准确率 88%，规则集 4635 条 | 词汇真实、结构漂移 |
+> | 四（Simple Wiki 朴素文法） | 规则准确率 76%，规则集 3175 条 | 结构 100% 合规（脚手架），词分布真实、语义随机 |
 >
 > 而**结构固定**的任务（cloze / 续写）在三中表现良好——说明解码器已学会"按结构选词"，自由生成的
 > 漂移主要来自**规则预测的剩余误差**与**缺少句子长度先验**。提升方向：更多数据/epochs 提高规则
 > 准确率、加入长度控制（如先采样句子长度再解码）、TreeLSTM 门控组合（见[扩展方向](#扩展方向)）。
 
 ---
+
+### 实验四：Simple Wikipedia 朴素风格生成（RvNN 编码-解码生成新段落）
+
+承接实验三：有了真实文法，能否用 RvNN 的**编码-解码（递归自编码器）**生成一段**不在训练样本中**、
+风格与训练样本里的朴素模板句 `A bridge spans this river` 一致的段落？
+
+#### 1. 数据
+
+**Parsed Simple English Wikipedia**（Brown BLLIP）——Simple English Wikipedia（<https://simple.wikipedia.org/>，
+用基础词汇写成的百科）全量自动解析，PTB 风格成分树、一行一棵：
+<http://bllip.cs.brown.edu/download/simplewiki.ptb>（自动下载，约 33 MB，**197,541 棵树**）。
+
+为复现"朴素"风格，训练子集经过滤器筛出**朴素句**：`ROOT → S`、4–9 词、无从句/专名/数字/标点误标
+（标点被解析器误标成 `JJ` 等词性的句子也剔除）——共 **22,380 句**（约占 11%），
+例如 `A lemon is a yellow citrus fruit`、`A circle has a centre`。文法归纳后剔除左递归规则
+（真实树库含 `NP → NP PP` 这类结构，递归下降解析器要求无左递归文法）。
+
+#### 2. 实验步骤
+
+1. 归纳朴素文法：**41 个类别、3175 条规则**（`S → NP VP`、`NP → DT NN`、`NP → DT NP`…）；
+   词表按 `min_count=2` 过滤，并**强制保留风格锚点句的 3 个稀有词**（bridge/spans/river，
+   在训练子集中各仅出现 1 次）以保证锚点句可解析；
+2. 训练：与实验一/三同款 RAE 目标（规则 CE + 单词 CE + 重构 + `mask_frac=0.15`），
+   `4000 train / 500 dev`、`dim=64`、Adam（lr=1e-3）、8 epochs；
+3. **编码-解码生成**：解析锚点句 → 自底向上**编码**成根向量 `h` → 加高斯噪声 →
+   沿锚点句骨架**解码**（每个内部节点用解码器逆投影 `D_left`/`D_right`/`D_unary` 得到子节点向量，
+   每个词性位从词预测器采样单词，`<unk>` 的对数几率在解码时屏蔽）——结构继承自锚点句、内容全新。
+
+复现命令：
+
+```bash
+python -m rvnn_text.simplewiki train --max_train 4000 --max_dev 500 --dim 64 --epochs 8 --min_word_count 2
+PYTHONHASHSEED=0 python -m rvnn_text.simplewiki generate --seed 7 --temperature 0.4 --seed_noise 0.3
+```
+
+#### 3. 实验结果（Apple Silicon MPS）
+
+| 指标 | 数值 |
+|---|---|
+| held-out 规则预测准确率 | **76.2%**（3175 规则） |
+| held-out 单词预测准确率 | **78.8%** |
+| 训练损失 | 3.9345 → 1.1380（8 epochs） |
+
+**生成段落**（5 句，逐句经 token 序列比对确认**不在语料中**，novel）：
+
+```
+family air is a university. philosophy voice is this note. Climate power is a information.
+war power is a space. history source spans a child.
+```
+
+- **结构 100% 合规**：5 句全部与锚点句同骨架 `DT NN VBZ DT NN`（主语 NP + 及物谓语 + 宾语 NP）；
+- **锚点句影响可见**：`history source spans a child` 中的 `spans` 正是锚点句的动词——编码向量把
+  "桥跨河"的搭配倾向传给了解码器（不同 seed 下反复出现 `spans a …`）；
+- 词汇全部来自语料高频词（family/air/university/philosophy/note/power/space/history/source/child）。
+
+> **诚实的局限**：判别式 RvNN 的词预测器**按词性独立采样**，没有语言模型式的语义连贯性先验——
+> 因此句子的语法骨架完全合规、词汇常用，但**语义组合是随机的**（`family air` 这类搭配无意义），
+> 也没有冠词一致性（`a information`）。这与实验二"词汤"同源：RvNN 学到的是**结构与词分布**，
+> 不是语义。若要语义连贯需叠加语言模型解码（RvNN 结构 + LM 选词），列为扩展方向。
+
+> **附加观察（自由生成坍缩）**：不做脚手架、直接从先验解码时，生成会**坍缩到语料众数**
+> （本实验为 `He is <unk> …`，因传记类文章以 `He is …` 开头最多）——这是"稀疏真实文法 +
+> 先验采样"的固有行为；结构脚手架是把解码器引导回合法空间的实用手段（与实验二/三同机制）。
 
 ## 项目结构
 
@@ -607,6 +671,7 @@ rvnn-text/
 │   ├── generate.py     # 生成（fire CLI）
 │   ├── sst.py          # 实验二：SST-5 真实语料情感分析（判别式 RvNN，fire CLI）
 │   ├── genia.py        # 实验三：GENIA 真实成分树库上的结构约束生成（fire CLI）
+│   ├── simplewiki.py   # 实验四：Simple Wikipedia 朴素风格 RvNN 编码-解码生成（fire CLI）
 │   ├── demo.py         # 端到端演示（fire CLI）
 │   ├── checkpoint.py   # 模型保存 / 加载
 │   └── utils.py        # 设备选择、随机种子
@@ -634,6 +699,7 @@ python -m pytest
 |---|---|---|---|
 | 实验二 | Stanford Sentiment Treebank (SST-5) | <https://nlp.stanford.edu/sentiment/> | 括号树 + 逐节点 0~4 情感标签，**无句法类别** |
 | 实验三 | **GENIA Treebank 1.0**（生物医学） | <http://bllip.cs.brown.edu/download/genia1.0-division-rel1.tar.gz> | PTB 风格成分树，**带完整句法类别**（S/NP/VP/PP…），14,326 train / 1,361 dev |
+| 实验四 | **Parsed Simple English Wikipedia** | <http://bllip.cs.brown.edu/download/simplewiki.ptb>（Simple Wikipedia <https://simple.wikipedia.org/>） | PTB 风格成分树，197,541 句；朴素子集 22,380 句 |
 
 ### 数据格式示例（GENIA 成分树）
 
@@ -690,7 +756,8 @@ python -m pytest
 - **变分先验（VAE）**：当前的生成先验是"可学习均值向量 + 高斯噪声"，解码会偏向某个区域。
   改为变分自编码器（对根向量学习均值/方差并加 KL 正则）可得到平滑、可控的生成分布。
 - **真实数据（已实现）**：实验二在 SST-5 上做根节点情感分类、实验三在 GENIA 成分树库上做结构约束
-  生成（见[实验](#实验)）；进一步可用全量 GENIA/PTB、更大 dim 与预训练词向量提升质量。
+  生成、实验四在 Simple Wikipedia 上做朴素风格编码-解码生成（见[实验](#实验)）；进一步可用全量
+  GENIA/PTB、更大 dim 与预训练词向量提升质量。
 - **递归批处理**：当前按树逐个训练；对同构子树做批处理（如 TreeLSTM 的批处理技巧）可显著加速。
 - **更丰富的组合函数**：如 Recursive Neural Tensor Network（Socher 2013）、Gated RvNN（TreeLSTM）。
 - **任意文法**：`Grammar` 支持自定义产生式（arity ≤ 2），可直接换成中文、代码或 SQL 的文法。

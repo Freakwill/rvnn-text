@@ -30,7 +30,7 @@ import torch
 
 from .checkpoint import load_model, save_checkpoint
 from .genia import PUNCT_POS, _prune_punct, build_grammar, parse_ptb
-from .grammar import flatten
+from .grammar import Node, flatten
 from .sst import binarize, build_vocab, map_oov
 from .train import train_model
 from .utils import get_device, set_seed
@@ -147,8 +147,10 @@ def main(
     dim: int = 64,
     epochs: int = 8,
     lr: float = 1e-3,
+    recon_weight: float = 1.0,
     mask_frac: float = 0.15,
     min_word_count: int = 2,
+    exemplar: str = "A bridge spans this river",
     n_sentences: int = 6,
     max_depth: int = 12,
     temperature: float = 0.8,
@@ -175,6 +177,11 @@ def main(
     # token-sequence snapshot BEFORE map_oov rewrites OOV words to <unk>
     train_seen = {tuple(w.lower() for w in flatten(t)) for t in train_trees}
     vocab = build_vocab(train_trees, min_word_count)
+    # Keep the style-exemplar's words in the vocabulary even if they are
+    # singletons in the training subset, so the exemplar stays parseable.
+    for w in exemplar.split():
+        if w not in vocab:
+            vocab[w] = len(vocab)
     for tree in train_trees + dev_trees:
         map_oov(tree, vocab)
     grammar = build_grammar(train_trees)
@@ -185,7 +192,8 @@ def main(
 
     model, losses = train_model(
         grammar, train_trees, val_trees=dev_trees, dim=dim, epochs=epochs,
-        lr=lr, mask_frac=mask_frac, device=device, sample_interval=epochs,
+        lr=lr, recon_weight=recon_weight, mask_frac=mask_frac,
+        device=device, sample_interval=epochs,
     )
     model.eval()
     acc = model.evaluate(dev_trees)
@@ -238,6 +246,60 @@ def main(
         print(f"saved checkpoint to {path}")
 
 
+def _sample_word_no_unk(model, symbol: str, h, temperature: float) -> str:
+    """Sample a word for ``symbol`` with the ``<unk>`` logit masked out.
+
+    Decode-time constraint (reported honestly): with ``min_count`` filtering,
+    ``<unk>`` absorbs all rare words and becomes a high-mass class, so plain
+    sampling emits it constantly; masking it forces a real vocabulary word.
+    """
+    logits = model.word_predictors[symbol](h)
+    words = model.preterm_words[symbol]
+    unk = words.index("<unk>") if "<unk>" in words else None
+    if unk is not None:
+        logits = logits.clone()
+        logits[unk] = float("-inf")
+    return words[model._sample(logits, temperature, False)]
+
+
+def _scaffold_generate(model, exemplar_tree, temperature: float, seed_noise: float,
+                       no_unk: bool = True):
+    """Decode new words over the exemplar's tree skeleton (structure scaffold).
+
+    Encode-decode mechanism: the exemplar is encoded bottom-up into its root
+    vector; decoding walks the same skeleton top-down, at every node applying
+    the decoder's inverse projections (``D_left``/``D_right``/``D_unary``) and
+    sampling a word from each preterminal's predictor.  Structure is inherited
+    from the exemplar; content is novel.
+    """
+    h = model.encode(exemplar_tree)
+    if seed_noise > 0.0:
+        h = h + seed_noise * torch.randn_like(h)
+
+    def pick(symbol, h):
+        if no_unk:
+            return _sample_word_no_unk(model, symbol, h, temperature)
+        return model._sample_word(symbol, h, temperature, False)
+
+    def walk(skel, h, depth=0):
+        if skel.is_leaf:
+            return Node(symbol=skel.symbol, word=pick(skel.symbol, h))
+        rule = tuple(c.symbol for c in skel.children)
+        children = []
+        for pos, child in enumerate(skel.children):
+            if child.is_leaf:
+                children.append(Node(symbol=child.symbol, word=pick(child.symbol, h)))
+            else:
+                if len(rule) == 1:
+                    h_child = model.D_unary(h)
+                else:
+                    h_child = model.D_left(h) if pos == 0 else model.D_right(h)
+                children.append(walk(child, h_child, depth + 1))
+        return Node(symbol=skel.symbol, children=children)
+
+    return walk(exemplar_tree, h)
+
+
 def generate(
     data_dir: str = "data/simplewiki",
     checkpoint: str = "checkpoints/simplewiki.pt",
@@ -246,6 +308,8 @@ def generate(
     max_depth: int = 12,
     temperature: float = 0.8,
     seed_noise: float = 0.5,
+    greedy: bool = False,
+    scaffold: bool = True,
     seed: int = 42,
 ) -> None:
     """Load a trained model and generate a paragraph conditioned on an exemplar.
@@ -256,6 +320,7 @@ def generate(
     The paragraph is the exemplar plus novel continuations, none of which
     appear verbatim in the corpus.
     """
+    set_seed(seed)
     device = get_device()
     model = load_model(checkpoint, device)
     model.eval()
@@ -281,15 +346,18 @@ def generate(
     print("=" * 70)
     sents = []
     for _ in range(n_sentences):
-        tree = model.generate(root_embedding=h, temperature=temperature,
-                              max_depth=max_depth)
+        if scaffold:
+            tree = _scaffold_generate(model, parsed, temperature, seed_noise)
+        else:
+            tree = model.generate(root_embedding=h, temperature=temperature,
+                                  max_depth=max_depth, greedy=greedy)
         sents.append(to_sentence(tree))
     for s in sents:
         status = "novel" if tuple(s.lower().split()) not in corpus else "in-corpus"
         print(f"  [{status:9s}] {s}")
     print()
-    print("paragraph:")
-    print(f"  {exemplar}. {' '.join(s + '.' for s in sents)}")
+    print(f"novel paragraph (style seed {exemplar!r}):")
+    print(f"  {' '.join(s + '.' for s in sents)}")
 
 
 def cli():
