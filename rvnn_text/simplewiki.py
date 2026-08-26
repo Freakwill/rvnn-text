@@ -26,7 +26,9 @@ import urllib.request
 from pathlib import Path
 
 import fire
+import torch
 
+from .checkpoint import load_model, save_checkpoint
 from .genia import PUNCT_POS, _prune_punct, build_grammar, parse_ptb
 from .grammar import flatten
 from .sst import binarize, build_vocab, map_oov
@@ -119,6 +121,19 @@ def corpus_sentences(path: Path) -> set[tuple[str, ...]]:
     return seen
 
 
+def _remove_left_recursion(grammar) -> None:
+    """Drop productions ``X -> X ...`` (parser requires a left-recursion-free grammar).
+
+    Real treebanks contain left-recursive structures (e.g. ``NP -> NP PP``);
+    the induced grammar keeps them for the model to compose, but the
+    recursive-descent parser (used for prompt parsing) would loop forever.
+    """
+    for sym, rules in grammar.productions.items():
+        grammar.productions[sym] = [
+            r for r in rules if not r or r[0] != sym
+        ]
+
+
 def to_sentence(tree) -> str:
     return " ".join(flatten(tree))
 
@@ -137,6 +152,10 @@ def main(
     n_sentences: int = 6,
     max_depth: int = 12,
     temperature: float = 0.8,
+    seed_noise: float = 1.0,
+    greedy: bool = False,
+    save: bool = True,
+    out_dir: str = "checkpoints",
     seed: int = 42,
 ) -> None:
     """Train a plain-style RvNN on Simple Wikipedia and generate a paragraph."""
@@ -153,10 +172,13 @@ def main(
 
     train_trees = plain[:max_train]
     dev_trees = plain[max_train:max_train + max_dev]
+    # token-sequence snapshot BEFORE map_oov rewrites OOV words to <unk>
+    train_seen = {tuple(w.lower() for w in flatten(t)) for t in train_trees}
     vocab = build_vocab(train_trees, min_word_count)
     for tree in train_trees + dev_trees:
         map_oov(tree, vocab)
     grammar = build_grammar(train_trees)
+    _remove_left_recursion(grammar)
     n_rules = sum(len(r) for r in grammar.productions.values())
     print(f"vocab={len(vocab)} (min_count={min_word_count} + <unk>), "
           f"categories={len(grammar.productions)}, rules={n_rules}, start={grammar.start}")
@@ -176,11 +198,10 @@ def main(
     print("=" * 70)
 
     corpus = corpus_sentences(data_path)
-    train_seen = {tuple(w.lower() for w in flatten(t)) for t in train_trees}
     sents = []
     for _ in range(n_sentences):
-        tree = model.generate(seed_noise=1.0, max_depth=max_depth,
-                              temperature=temperature)
+        tree = model.generate(seed_noise=seed_noise, max_depth=max_depth,
+                              temperature=temperature, greedy=greedy)
         sents.append(to_sentence(tree))
     paragraph = ". ".join(s + "." for s in sents)
     for s in sents:
@@ -193,13 +214,86 @@ def main(
     print("paragraph:")
     print(f"  {paragraph}")
 
+    # greedy variant: argmax rule/word at every node (cleaner, deterministic)
+    print()
+    print("-" * 70)
+    print("greedy variant (argmax at every node):")
+    g_sents = []
+    for _ in range(n_sentences):
+        tree = model.generate(max_depth=max_depth, greedy=True)
+        g_sents.append(to_sentence(tree))
+    for s in g_sents:
+        toks = tuple(s.lower().split())
+        status = "novel" if toks not in corpus else "in-corpus"
+        print(f"  [{status:9s}] {s}")
+    print("greedy paragraph:")
+    print(f"  {'. '.join(s + '.' for s in g_sents)}")
+
     exemplar = "a bridge spans this river"
     in_train = tuple(exemplar.split()) in train_seen
     print(f"\nexemplar '{exemplar}' in training set: {in_train}")
 
+    if save:
+        path = save_checkpoint(model, f"{out_dir}/simplewiki.pt")
+        print(f"saved checkpoint to {path}")
+
+
+def generate(
+    data_dir: str = "data/simplewiki",
+    checkpoint: str = "checkpoints/simplewiki.pt",
+    exemplar: str = "A bridge spans this river",
+    n_sentences: int = 6,
+    max_depth: int = 12,
+    temperature: float = 0.8,
+    seed_noise: float = 0.5,
+    seed: int = 42,
+) -> None:
+    """Load a trained model and generate a paragraph conditioned on an exemplar.
+
+    Encode-decode mechanism: the exemplar sentence is parsed and encoded
+    bottom-up into a root vector ``h``; every generated sentence is then
+    decoded top-down from ``h`` (+ noise) — the RvNN's autoencoder inverse.
+    The paragraph is the exemplar plus novel continuations, none of which
+    appear verbatim in the corpus.
+    """
+    device = get_device()
+    model = load_model(checkpoint, device)
+    model.eval()
+    data_path = ensure_data(data_dir)
+    corpus = corpus_sentences(data_path)
+
+    # Parse with a left-recursion-free copy of the grammar (the model itself
+    # keeps the full induced grammar for composition and decoding).
+    from copy import deepcopy
+
+    parse_grammar = deepcopy(model.grammar)
+    _remove_left_recursion(parse_grammar)
+    parsed = parse_grammar.parse_sentence(exemplar)
+    if parsed is None:
+        print(f"exemplar {exemplar!r} is not parseable by the induced grammar")
+        return
+    h = model.encode(parsed)
+    if seed_noise > 0.0:
+        h = h + seed_noise * torch.randn_like(h)
+
+    print("=" * 70)
+    print(f"Encode-decode generation from exemplar: {exemplar!r}")
+    print("=" * 70)
+    sents = []
+    for _ in range(n_sentences):
+        tree = model.generate(root_embedding=h, temperature=temperature,
+                              max_depth=max_depth)
+        sents.append(to_sentence(tree))
+    for s in sents:
+        status = "novel" if tuple(s.lower().split()) not in corpus else "in-corpus"
+        print(f"  [{status:9s}] {s}")
+    print()
+    print("paragraph:")
+    print(f"  {exemplar}. {' '.join(s + '.' for s in sents)}")
+
 
 def cli():
-    fire.Fire(main)
+    fire.Fire({"train": main, "generate": generate})
 
 
 if __name__ == "__main__":

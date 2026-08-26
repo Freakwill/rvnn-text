@@ -142,16 +142,22 @@ class Grammar:
 
     # -- parsing -----------------------------------------------------------
 
-    def parse(self, tokens: list[str] | tuple[str, ...]) -> Node | None:
+    def parse(self, tokens: list[str] | tuple[str, ...],
+              max_depth: int = 120) -> Node | None:
         """Parse a token sequence into a tree (top-down with memoization).
 
-        Returns ``None`` if the sentence is outside the grammar. The grammar is
-        assumed to be free of left recursion.
+        Returns ``None`` if the sentence is outside the grammar. ``max_depth``
+        caps the derivation depth so grammars induced from real treebanks
+        (which contain indirect left recursion, e.g. ``NP -> ADJP -> ... ->
+        NP``) terminate instead of recursing forever; the cyclic branches
+        never consume input, so cutting them loses no valid parse.
         """
         tokens = tuple(tokens)
         memo: dict[tuple[str, int], list[tuple[Node, int]]] = {}
 
-        def rec(symbol: str, pos: int) -> list[tuple[Node, int]]:
+        def rec(symbol: str, pos: int, depth: int = 0) -> list[tuple[Node, int]]:
+            if depth > max_depth:
+                return []
             key = (symbol, pos)
             if key in memo:
                 return memo[key]
@@ -165,7 +171,7 @@ class Grammar:
                     for s in rhs:
                         next_states: list[tuple[int, list[Node]]] = []
                         for cur, children in states:
-                            for child, end in rec(s, cur):
+                            for child, end in rec(s, cur, depth + 1):
                                 next_states.append((end, children + [child]))
                         states = next_states
                     for end, children in states:
