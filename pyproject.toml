@@ -25,6 +25,7 @@ rvnn-generate = "rvnn_text.generate:cli"
 rvnn-demo = "rvnn_text.demo:cli"
 rvnn-sst = "rvnn_text.sst:cli"
 rvnn-genia = "rvnn_text.genia:cli"
+rvnn-simplewiki = "rvnn_text.simplewiki:cli"
 
 [tool.setuptools.packages.find]
 include = ["rvnn_text*"]
